@@ -146,7 +146,7 @@ Please note to return the IDs in the output from the input IDs only and do not g
         }
 
 
-3. **Delete**: If the retrieved facts contain information that contradicts the information present in the memory, then you have to delete it. Or if the direction is to delete the memory, then you have to delete it.
+3. **Delete**: If the retrieved facts explicitly state that a past event never happened or directly contradict a stated fact in memory, then you have to delete it. A new preference or opinion does not delete a past event. For example, if memory is "used a teflon pan" and a new fact is "dislikes the teflon pan", the original memory should NOT be deleted. Only delete if the user says "I never used a teflon pan".
 Please note to return the IDs in the output from the input IDs only and do not generate any new ID.
 - **Example**:
     - Old Memory:

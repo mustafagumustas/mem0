@@ -17,14 +17,14 @@ Guidelines:
    - Instead, mark it as 'ended' and add an appropriate 'end_date' to capture when it was superseded.
 
 2. Preserve Past Relationships
-   - If the user had a close friend and now they’re not friends, mark the friendship as ended. Do not remove references to past events—only the *active* relationship changes.
+   - If the user had a close friend and now they're not friends, mark the friendship as ended. Do not remove references to past events—only the *active* relationship changes.
 
 3. Identification
    - Use the 'source' and 'destination' as primary identifiers when matching existing memories to new information.
    - Compare these fields first to determine whether a relationship should be updated or added as a new entry.
 
 4. Handling Completely Incorrect Relationships
-   - If the new facts indicate the old relationship was never true (e.g., user originally said “I have a bike” but now clarifies they never did), mark the old relationship as 'invalid' instead of 'ended'.
+   - If the new facts indicate the old relationship was never true (e.g., user originally said "I have a bike" but now clarifies they never did), mark the old relationship as 'invalid' instead of 'ended'.
    - You may also include an 'invalid_date' or similar property to note when it was identified as incorrect.
 
 5. Conflict Resolution
@@ -45,10 +45,10 @@ Guidelines:
 8. Linking Entities Beyond the User
    - If new information clarifies or introduces relationships such as 'PART_OF', 'LOCATED_IN', 'SUBTYPE_OF', or 'SYNONYM_OF', ensure those links are created or updated between the relevant entities.
    - If two nodes turn out to be references to the same concept (synonyms), unify or connect them appropriately rather than duplicating data.
-   - If you store events or contexts, attach additional data (e.g., location, activities) to the same event node if itâ€™s the same scenario.
+   - If you store events or contexts, attach additional data (e.g., location, activities) to the same event node if it's the same scenario.
 
 9. Multiple Participants
-   - If the new facts show multiple actors performing the same action (e.g., user and roommate both reduce screen time), ensure each participant’s relationship is preserved or created distinctly.
+   - If the new facts show multiple actors performing the same action (e.g., user and roommate both reduce screen time), ensure each participant's relationship is preserved or created distinctly.
    - Do not collapse multi-actor relationships into a single fact that only references one participant.
 
 10. Node Label Consistency
@@ -68,10 +68,10 @@ Guidelines:
    - If you detect variations of the same relationship (e.g., "left_office" vs. "left"), unify them into one canonical name to maintain consistency.
 
 14. Temporal Awareness
-   - If timestamps are available, use them. Update or annotate relationships with 'start_date' or 'end_date' (or 'invalid_date') so the user’s life history remains accurate.
+   - If timestamps are available, use them. Update or annotate relationships with 'start_date' or 'end_date' (or 'invalid_date') so the user's life history remains accurate.
 
 15. Occupation / Job Node Handling
-   - If new facts reveal multiple details about a user’s work (e.g., employer, role, duration), unify them under a single "Job" or "Experience" node. For example:
+   - If new facts reveal multiple details about a user's work (e.g., employer, role, duration), unify them under a single "Job" or "Experience" node. For example:
      1) (User) --:HOLDS_POSITION--> (JobNode)
      2) (JobNode) --:works_at--> (Employer)
      3) (JobNode) --:role--> (Title)
@@ -118,39 +118,28 @@ Follow these key principles:
    - Avoid assumptions. Only create relationships and facts clearly mentioned in the text.
 
 2. Self-References
-   - When the user says “I,” “me,” “my,” and so on, treat it as "USER_ID" or the designated user node.
+   - When the user says "I," "me," "my," and so on, treat it as "USER_ID" or the designated user node.
 
 3. Node Labeling
-   - Use a defined or consistently updated set of labels (e.g., Person, Organization, Location, Emotion, Concept) that accurately reflect each entity’s type.
+   - Use a defined or consistently updated set of labels (e.g., Person, Organization, Location, Emotion, Concept) that accurately reflect each entity's type.
    - If an entity fits multiple categories or subcategories, apply additional labels as appropriate, ensuring consistency with any existing labeling conventions.
    - Keep each labeled entry concise yet comprehensive, so future queries can easily distinguish entity types.
-create a direct edge between them. Common examples:
-     - A --:LOCATED_IN--> B
-     - A --:PART_OF--> B
-   - If the text indicates one entity is a subtype or more specific version of another (e.g., â€œCaesar salad is a type of salad
-     - A --:SUBTYPE_OF--> B
-     - A --:SYNONYM_OF--> B
-   - Only create these entity-to-entity links if the statement is explicit or very strongly implied. If unsure, set is_uncertain=true or assign a lower weight.
-   - IMPORTANT: Not all “went to” references are locations. For instance, “bed” is an item of furniture, not a Location. Label such smaller objects as “Object” or “Furniture” rather than “Location.”
 
 4. Relationships
    - Use consistent, general, and timeless relationship types rather than time-bound or event-specific forms (e.g., prefer "professor" over "became_professor").
-   - Establish relationships only among entities explicitly mentioned in the user’s message.
+   - Establish relationships only among entities explicitly mentioned in the user's message.
 
 5. Uncertainty
-   - If the user expresses uncertainty (e.g., “I might move to London or Berlin”), capture it with an `is_uncertain=true` or a lower weight.
+   - If the user expresses uncertainty (e.g., "I might move to London or Berlin"), capture it with an `is_uncertain=true` or a lower weight.
 
 6. Emotions & Psychological Data
    - If the user expresses an emotion or mood (e.g., sad, happy, anxious), create a relationship capturing it. Include a timestamp or date to track changes over time.
 
 7. Opinions & Preferences
-   - If the user states likes or dislikes (e.g., “I love hiking,” “I hate apples”), store them as relationships (“likes,” “dislikes,” etc.).
-   - Keep older opinions if the user’s feelings change—just mark the date or status as ended.
+   - If the user states likes or dislikes (e.g., "I love hiking," "I hate apples"), store them as relationships ("likes," "dislikes," etc.).
 
 8. Confidence/Weight
    - Assign a numerical weight in the range [0.00, 1.00] to each extracted fact, reflecting your initial estimate of certainty or relevance, solely based on the current user statement.
-   - Do not use a fixed or preset scale; determine the weight freely.
-   - Any deeper analysis or refinement of weights can occur in a later step.
 
 9. Output Format
    - Return a single JSON object: {"facts": [ ... ]}
@@ -173,7 +162,7 @@ create a direct edge between them. Common examples:
        "usage_count": "<optional: integer count of how many times this was mentioned, starts at 1>",
        "notes": "<optional>"
      }
-   - Note: Typically, “invalid” is used if the text itself indicates the statement was never true in this same utterance. Otherwise, mark as "active" or "ended," etc.
+   - Note: Typically, "invalid" is used if the text itself indicates the statement was never true in this same utterance. Otherwise, mark as "active" or "ended," etc.
 
 10. Automatic Tracking
     - The system automatically tracks 'last_mentioned' (current timestamp) and 'usage_count' (increments each mention) for relationship usage analytics.
@@ -380,42 +369,48 @@ Guidelines:
    - Compare 'source' and 'relationship' and 'destination' to see if the relationship is still valid.
 
 3. DO NOT END or INVALIDATE if there is a possibility that a similar relationship could coexist.
-   - Example: If “alice -- loves_to_eat -- pizza” exists and new information is “Alice also loves to eat burgers,” do not mark pizza as ended or invalid. Both can be true.
+   - Example: If "alice -- loves_to_eat -- pizza" exists and new information is "Alice also loves to eat burgers," do not mark pizza as ended or invalid. Both can be true.
 
-4. Special Note for Entity-to-Entity Links
+4. Preserve Historical Events
+   - Do not mark a past event as ended or invalid simply because a new preference or opinion about one of the entities has been expressed.
+   - A user's opinion (e.g., disliking an object) does not invalidate a historical fact (e.g., that they used the object). Both facts should coexist unless the user explicitly denies the event occurred.
+   - For example, if memory contains "USER_ID -- cooked_with --> teflon_pan" and new information is "USER_ID -- dislikes --> teflon_pan", the `cooked_with` relationship should be preserved.
+
+5. Special Note for Entity-to-Entity Links
    - Part-of, located-in, subtype-of, or synonym-of relationships should not be ended or invalidated unless the user explicitly states they are incorrect or no longer valid.
 n that forest.
 
-5. Deletion Criteria
+6. Deletion Criteria
    - Instead of permanently deleting any relationship, use one of the following approaches to preserve historical context:
 
-   5.1. Mark as "ended"
+   6.1. Mark as "ended"
        - If the old relationship was valid in the past (e.g., user used to live somewhere or used to have something) but is no longer true.
        - Add an appropriate "end_date" to capture when it was superseded or became inactive.
 
-   5.2. Mark as "invalid"
+   6.2. Mark as "invalid"
        - If the new information shows the old statement was never true or is fundamentally incorrect (e.g., user says "I have a bike" and then admits they never did).
        - Use "status": "invalid" (instead of "ended") to clearly indicate it was never valid at any point in time.
        - You may add a property like "invalid_date" if you wish to track when it was identified as incorrect.
 
-6. Comprehensive Analysis
+7. Comprehensive Analysis
    - Thoroughly examine each existing relationship against the new information and mark them as ended or invalid as necessary.
    - Multiple relationships may need to be adjusted based on the new information.
 
-7. Semantic Integrity
+8. Semantic Integrity
    - Ensure that marking a relationship as ended or invalid maintains or improves the overall semantic structure of the graph.
    - Avoid altering any relationships that remain relevant or correct in light of new information.
 
-8. Temporal Awareness
-   - Prioritize recency when timestamps are available. If new information is more recent, consider the older relationship ended or invalid as appropriate.
+9. Temporal Awareness
+   - Use timestamps to understand the sequence of events. If a new fact directly replaces an old one (e.g., a user moves from one city to another), use the timestamp to mark the old fact as "ended."
+   - Do not end a historical event just because it is older than a new, related opinion.
 
-9. Output
-   - Provide a list of instructions for each relationship that needs to be updated. For each, specify:
-     - The source
-     - The relationship
-     - The destination
-     - The status: "ended" or "invalid"
-     - The end_date or invalid_date (if available or applicable)
+10. Output
+    - Provide a list of instructions for each relationship that needs to be updated. For each, specify:
+      - The source
+      - The relationship
+      - The destination
+      - The status: "ended" or "invalid"
+      - The end_date or invalid_date (if available or applicable)
 """
 
 

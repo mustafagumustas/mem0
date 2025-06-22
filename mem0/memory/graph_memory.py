@@ -69,18 +69,18 @@ class MemoryGraph:
         search_output = self._search_graph_db(
             node_list=list(entity_type_map.keys()), filters=filters
         )
-        to_be_deleted = self._get_delete_entities_from_search_output(
+        to_be_updated = self._get_delete_entities_from_search_output(
             search_output, data, filters
         )
 
         # TODO: Batch queries with APOC plugin
         # TODO: Add more filter support
-        deleted_entities = self._delete_entities(to_be_deleted, filters["user_id"])
+        updated_entities = self._process_relationship_updates(to_be_updated, filters["user_id"])
         added_entities = self._add_entities(
             to_be_added, filters["user_id"], entity_type_map
         )
 
-        return {"deleted_entities": deleted_entities, "added_entities": added_entities}
+        return {"updated_entities": updated_entities, "added_entities": added_entities}
 
     def search(self, query, filters, limit=100):
         """
@@ -443,104 +443,48 @@ class MemoryGraph:
             ],
             tools=_tools,
         )
-        to_be_deleted = []
+        to_be_updated = []
         for item in memory_updates["tool_calls"]:
             if item["name"] == "delete_graph_memory":
-                to_be_deleted.append(item["arguments"])
+                to_be_updated.append(item["arguments"])
         # in case if it is not in the correct format
-        to_be_deleted = self._remove_spaces_from_entities(to_be_deleted)
-        logger.debug(f"Deleted relationships: {to_be_deleted}")
-        return to_be_deleted
+        to_be_updated = self._remove_spaces_from_entities(to_be_updated)
+        logger.debug(f"Deleted relationships: {to_be_updated}")
+        return to_be_updated
 
-    def _delete_entities(self, to_be_deleted, user_id):
-        """Delete the entities from the graph."""
+    def _process_relationship_updates(self, to_be_updated, user_id):
+        """Update the status of relationships in the graph, marking them as ended or invalid."""
         results = []
-        for item in to_be_deleted:
+        for item in to_be_updated:
             source = item["source"]
             destination = item["destination"]
             relationship_type = item["relationship"]
+            status = item.get("status", "ended")  # Default to 'ended'
 
-            # Check if the relationship exists first
-            check_cypher = """
-            MATCH (n {name: $source_name, user_id: $user_id})
-            MATCH (m {name: $dest_name, user_id: $user_id})
-            WITH n, m
-            OPTIONAL MATCH (n)-[r]->(m)
-            WHERE type(r) = $relationship_type
-            RETURN 
-                n.name AS source,
-                m.name AS target,
-                type(r) AS relationship,
-                r.weight AS weight,
-                r.is_uncertain AS is_uncertain,
-                r.status AS status,
-                r.start_date AS start_date,
-                r.end_date AS end_date,
-                r.emotion AS emotion,
-                r.last_mentioned AS last_mentioned,
-                r.usage_count AS usage_count
-            LIMIT 1
-            """
-            params = {
-                "source_name": source,
-                "dest_name": destination,
-                "user_id": user_id,
-                "relationship_type": relationship_type,
-            }
-
-            # First fetch the relationship data
-            result_data = self.graph.query(check_cypher, params=params)
-
-            # Only delete if relationship exists
-            if result_data and result_data[0]["relationship"] is not None:
-                # Now delete the relationship
-                delete_cypher = """
-                MATCH (n {name: $source_name, user_id: $user_id})
-                -[r]->(m {name: $dest_name, user_id: $user_id})
-                WHERE type(r) = $relationship_type
-                DELETE r
-                """
-                self.graph.query(delete_cypher, params=params)
-
-                # Process the result data to include optional parameters
-                result_dict = {
-                    "source": result_data[0]["source"],
-                    "relationship": result_data[0]["relationship"],
-                    "target": result_data[0]["target"],
-                }
-
-                # Add optional parameters if they exist
-                if result_data[0].get("weight") is not None:
-                    result_dict["weight"] = result_data[0]["weight"]
-                if result_data[0].get("is_uncertain") is not None:
-                    result_dict["is_uncertain"] = result_data[0]["is_uncertain"]
-                if result_data[0].get("status") is not None:
-                    result_dict["status"] = result_data[0]["status"]
-                if result_data[0].get("start_date") is not None:
-                    result_dict["start_date"] = result_data[0]["start_date"]
-                if result_data[0].get("end_date") is not None:
-                    result_dict["end_date"] = result_data[0]["end_date"]
-                if result_data[0].get("emotion") is not None:
-                    result_dict["emotion"] = result_data[0]["emotion"]
-                if result_data[0].get("last_mentioned") is not None:
-                    result_dict["last_mentioned"] = result_data[0]["last_mentioned"]
-                if result_data[0].get("usage_count") is not None:
-                    result_dict["usage_count"] = result_data[0]["usage_count"]
-
-                results.append(result_dict)
+            properties_to_update = {"status": status}
+            
+            if status in ["ended", "invalid"]:
+                properties_to_update["end_date"] = datetime.now(pytz.utc).isoformat()
+            
+            updated_rel = self.update_relationship(
+                source, relationship_type, destination, user_id, **properties_to_update
+            )
+            
+            if updated_rel and updated_rel.get("status") != "not_found":
+                results.append(updated_rel)
             else:
-                # Relationship wasn't found, so just return info that we tried to delete it
                 logger.debug(
-                    f"Relationship {relationship_type} between {source} and {destination} not found"
+                    f"Relationship {relationship_type} between {source} and {destination} not found for update."
                 )
                 results.append(
                     {
                         "source": source,
                         "relationship": relationship_type,
                         "target": destination,
-                        "status": "not_found",  # Add a status to indicate relationship wasn't found
+                        "status": "not_found",
                     }
                 )
+        logger.debug(f"Updated relationships: {results}")
         return results
 
     def _add_entities(self, to_be_added, user_id, entity_type_map):
