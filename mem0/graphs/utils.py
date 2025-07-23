@@ -133,13 +133,14 @@ Follow these key principles:
    - If the user expresses uncertainty (e.g., "I might move to London or Berlin"), capture it with an `is_uncertain=true` or a lower weight.
 
 6. Emotions & Psychological Data
-   - If the user expresses an emotion or mood (e.g., sad, happy, anxious), create a relationship capturing it. Include a timestamp or date to track changes over time.
+   - If the user expresses an emotion or mood (e.g., sad, happy, anxious), create a relationship capturing it.
+   - Detect emotional undertones in relationships using specific emotion words - reserve "neutral" only for truly emotionless statements.
 
 7. Opinions & Preferences
    - If the user states likes or dislikes (e.g., "I love hiking," "I hate apples"), store them as relationships ("likes," "dislikes," etc.).
 
 8. Confidence/Weight
-   - Assign a numerical weight in the range [0.00, 1.00] to each extracted fact, reflecting your initial estimate of certainty or relevance, solely based on the current user statement.
+   - Assign a significance category from ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"] to each extracted fact, reflecting how much this relationship matters to the user based on the current statement.
 
 9. Output Format
    - Return a single JSON object: {"facts": [ ... ]}
@@ -148,7 +149,7 @@ Follow these key principles:
        "source": "<string>",
        "relationship": "<string>",
        "destination": "<string>",
-       "weight": <float>,
+       "weight": "<string from enum>",
        "labels": {
          "source": "<string label>",
          "destination": "<string label>"
@@ -157,7 +158,7 @@ Follow these key principles:
        "status": "<optional: one of 'active', 'ended', 'uncertain', or 'invalid'>",
        "start_date": "<optional>",
        "end_date": "<optional>",
-       "emotion": "<optional>",
+       "emotion": "<required: emotional context>",
        "last_mentioned": "<optional: ISO timestamp when this relationship was last mentioned>",
        "usage_count": "<optional: integer count of how many times this was mentioned, starts at 1>",
        "notes": "<optional>"
@@ -183,7 +184,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "went_to",
       "destination": "Belgrad Forest",
-      "weight": 0.8,
+      "weight": "important",
       "labels": 
       "source": "Person",
       "destination": "Location"
@@ -193,7 +194,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "ran_on",
       "destination": "parkour",
-      "weight": 0.7,
+      "weight": "relevant",
       "labels": 
       "source": "Person",
       "destination": "Activity"
@@ -203,7 +204,7 @@ Expected Output:
       "source": "parkour",
       "relationship": "part_of",
       "destination": "Belgrad Forest",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": 
       "source": "Activity",
       "destination": "Location"
@@ -227,7 +228,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "wants_to_eat",
       "destination": "salad",
-      "weight": 0.8,
+      "weight": "important",
       "labels": 
       "source": "Person",
       "destination": "Food"
@@ -237,7 +238,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "likes",
       "destination": "caesar salad",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": 
       "source": "Person",
       "destination": "Food"
@@ -247,7 +248,7 @@ Expected Output:
       "source": "caesar salad",
       "relationship": "subtype_of",
       "destination": "salad",
-      "weight": 0.85,
+      "weight": "ritualistic",
       "labels": 
       "source": "Food",
       "destination": "Food"
@@ -270,7 +271,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "reduces",
       "destination": "screen time",
-      "weight": 0.8,
+      "weight": "important",
       "labels": {
         "source": "Person",
         "destination": "Concept"
@@ -280,7 +281,7 @@ Expected Output:
       "source": "roommate",
       "relationship": "reduces",
       "destination": "screen time",
-      "weight": 0.8,
+      "weight": "important",
       "labels": {
         "source": "Person",
         "destination": "Concept"
@@ -303,7 +304,7 @@ Expected Output (summary):
       "source": "USER_ID",
       "relationship": "holds_position",
       "destination": "job_experience_1",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": {
         "source": "Person",
         "destination": "Job"
@@ -313,7 +314,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "works_at",
       "destination": "Equinix",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": {
         "source": "Job",
         "destination": "Organization"
@@ -323,7 +324,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "role",
       "destination": "customer relations operator",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": {
         "source": "Job",
         "destination": "Concept"
@@ -333,7 +334,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "duration",
       "destination": "1 year",
-      "weight": 0.9,
+      "weight": "core_identity",
       "labels": {
         "source": "Job",
         "destination": "Concept"
@@ -347,6 +348,110 @@ Explanation:
 - The user has a "holds_position" relationship to job_experience_1.
 - job_experience_1 itself has "works_at" -> "Equinix", "role" -> "customer relations operator", and "duration" -> "1 year".
 - This approach keeps all job-related details in one cohesive node, letting us add more properties if needed (e.g., start_date, location).
+
+Example E (Rich Emotional Context):
+Input:
+"I absolutely love this new coffee shop downtown! The barista is so friendly and the atmosphere is perfect for working. But honestly, I'm getting a bit tired of their limited menu - I wish they had more variety."
+
+Expected Output:
+{
+  "facts": [
+    {
+      "source": "USER_ID",
+      "relationship": "loves",
+      "destination": "new coffee shop downtown",
+      "weight": "devotion",
+      "labels": {
+        "source": "Person",
+        "destination": "Place"
+      },
+      "emotion": "enthusiastic"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "appreciates",
+      "destination": "barista",
+      "weight": "important",
+      "labels": {
+        "source": "Person",
+        "destination": "Person"
+      },
+      "emotion": "grateful"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "enjoys",
+      "destination": "atmosphere",
+      "weight": "ritualistic",
+      "labels": {
+        "source": "Person",
+        "destination": "Concept"
+      },
+      "emotion": "content"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "tired_of",
+      "destination": "limited menu",
+      "weight": "relevant",
+      "labels": {
+        "source": "Person",
+        "destination": "Concept"
+      },
+      "emotion": "frustrated"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "wishes_for",
+      "destination": "more variety",
+      "weight": "transitional",
+      "labels": {
+        "source": "Person",
+        "destination": "Concept"
+      },
+      "emotion": "longing"
+    },
+    {
+      "source": "barista",
+      "relationship": "works_at",
+      "destination": "new coffee shop downtown",
+      "weight": "core_identity",
+      "labels": {
+        "source": "Person",
+        "destination": "Place"
+      },
+      "emotion": "neutral"
+    },
+    {
+      "source": "atmosphere",
+      "relationship": "part_of",
+      "destination": "new coffee shop downtown",
+      "weight": "core_identity",
+      "labels": {
+        "source": "Concept",
+        "destination": "Place"
+      },
+      "emotion": "neutral"
+    },
+    {
+      "source": "limited menu",
+      "relationship": "part_of",
+      "destination": "new coffee shop downtown",
+      "weight": "core_identity",
+      "labels": {
+        "source": "Concept",
+        "destination": "Place"
+      },
+      "emotion": "neutral"
+    }
+  ]
+}
+
+Explanation:
+- Multiple emotional contexts from one statement: enthusiasm for the place, gratitude toward staff, frustration with limitations
+- User-entity relationships get emotional context, while entity-entity relationships remain neutral
+- Rich emotional vocabulary: "enthusiastic", "grateful", "content", "frustrated", "longing"
+- Each relationship captures the specific emotional nuance of that connection
 
 """
 
