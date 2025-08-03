@@ -534,92 +534,69 @@ Return updated weight, emotion, status, and analysis flags."""
 
     def _search_graph_db(self, node_list, filters, limit=100):
         """Search similar nodes among and their respective incoming and outgoing relations."""
-        result_relations = []
+        if not node_list:
+            return []
 
-        for i, node in enumerate(node_list):
-            n_embedding = self.embedding_model.embed(node)
+        # Prepare a list of nodes with their embeddings to pass as a single parameter
+        nodes_with_embeddings = [
+            {"name": node, "embedding": self.embedding_model.embed(node)}
+            for node in node_list
+        ]
 
-            cypher_query = """
-            MATCH (n)
-            WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
-            WITH n,
-                round(reduce(dot = 0.0, i IN range(0, size(n.embedding)-1) | dot + n.embedding[i] * $n_embedding[i]) /
-                (sqrt(reduce(l2 = 0.0, i IN range(0, size(n.embedding)-1) | l2 + n.embedding[i] * n.embedding[i])) *
-                sqrt(reduce(l2 = 0.0, i IN range(0, size($n_embedding)-1) | l2 + $n_embedding[i] * $n_embedding[i]))), 4) AS similarity
-            WHERE similarity >= $threshold
+        # This single, optimized query implements the "Anchor-Expand" pattern.
+        # EFFICIENT: Similarity calculation happens only once in Step 2 to find anchors.
+        # The UNION in Step 3 does NOT recalculate similarity - it just expands from pre-found anchors.
+        cypher_query = """
+        // Step 1: UNWIND the list of nodes to process them in a batch.
+        UNWIND $nodes_with_embeddings AS search_item
+        
+        // Step 2: Find "anchor" nodes via vector similarity search (ONCE ONLY).
+        MATCH (n)
+        WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
+        WITH search_item, n, round(2 * vector.similarity.cosine(n.embedding, search_item.embedding) - 1, 4) AS similarity
+        WHERE similarity >= $threshold
+
+        // Order by similarity and limit to the top N results for each search item
+        WITH search_item, n, similarity
+        ORDER BY similarity DESC
+        WITH search_item, collect({n: n, similarity: similarity})[..$limit] AS top_nodes
+        UNWIND top_nodes AS top_node
+        WITH top_node.n AS n, top_node.similarity AS similarity
+
+        // Step 3: From the anchors, expand bidirectionally using a CALL subquery.
+        // EFFICIENT: No redundant similarity calculation here - 'n' is already the anchor.
+        CALL (n) {
             MATCH (n)-[r]->(m)
-            RETURN 
-                n.name AS source, 
-                elementId(n) AS source_id, 
-                type(r) AS relatationship, 
-                elementId(r) AS relation_id, 
-                m.name AS destination, 
-                elementId(m) AS destination_id, 
-                similarity,
-                r.weight AS weight,
-                r.is_uncertain AS is_uncertain,
-                r.status AS status,
-                r.start_date AS start_date,
-                r.end_date AS end_date,
-                r.emotion AS emotion,
-                r.last_mentioned AS last_mentioned,
-                r.usage_count AS usage_count
+            WHERE m.user_id = $user_id
+            RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relatationship,
+                   elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id,
+                   r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                   r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                   r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
             UNION
-            MATCH (n)
-            WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
-            WITH n,
-                round(reduce(dot = 0.0, i IN range(0, size(n.embedding)-1) | dot + n.embedding[i] * $n_embedding[i]) /
-                (sqrt(reduce(l2 = 0.0, i IN range(0, size(n.embedding)-1) | l2 + n.embedding[i] * n.embedding[i])) *
-                sqrt(reduce(l2 = 0.0, i IN range(0, size($n_embedding)-1) | l2 + $n_embedding[i] * $n_embedding[i]))), 4) AS similarity
-            WHERE similarity >= $threshold
             MATCH (m)-[r]->(n)
-            RETURN 
-                m.name AS source, 
-                elementId(m) AS source_id, 
-                type(r) AS relatationship, 
-                elementId(r) AS relation_id, 
-                n.name AS destination, 
-                elementId(n) AS destination_id, 
-                similarity,
-                r.weight AS weight,
-                r.is_uncertain AS is_uncertain,
-                r.status AS status,
-                r.start_date AS start_date,
-                r.end_date AS end_date,
-                r.emotion AS emotion,
-                r.last_mentioned AS last_mentioned,
-                r.usage_count AS usage_count
-            ORDER BY similarity DESC
-            LIMIT $limit
-            """
-            params = {
-                "n_embedding": n_embedding,
-                "threshold": self.threshold,
-                "user_id": filters["user_id"],
-                "limit": limit,
-            }
-            
-            ans = self.graph.query(cypher_query, params=params)
-            
-            # Update mention metadata for relationships found via similarity search
-            current_time_iso = datetime.now(pytz.utc).isoformat()
-            for relation in ans:
-                # Create a memory object for the metadata update
-                memory_obj = {
-                    "source": relation["source"],
-                    "relatationship": relation["relatationship"],  # Note: using original misspelling
-                    "destination": relation["destination"],
-                    "usage_count": relation.get("usage_count", 0)
-                }
-                
-                # Update metadata for this relationship selected via similarity search
-                self.update_mention_metadata(memory_obj, current_time_iso, filters["user_id"])
-                
-                # Update metadata for nodes involved in this relationship
-                self.update_node_mention_metadata(relation["source"], current_time_iso, filters["user_id"])
-                self.update_node_mention_metadata(relation["destination"], current_time_iso, filters["user_id"])
-            
-            result_relations.extend(ans)
+            WHERE m.user_id = $user_id
+            RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relatationship,
+                   elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id,
+                   r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                   r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                   r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
+        }
+        // Step 4: De-duplicate and return the final results with all rich metadata.
+        WITH DISTINCT source, source_id, relatationship, relation_id, destination, destination_id, similarity,
+             weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+        RETURN source, source_id, relatationship, relation_id, destination, destination_id, similarity,
+               weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+        """
+
+        params = {
+            "nodes_with_embeddings": nodes_with_embeddings,
+            "threshold": self.threshold,
+            "user_id": filters["user_id"],
+            "limit": limit,
+        }
+
+        result_relations = self.graph.query(cypher_query, params=params)
 
         return result_relations
 

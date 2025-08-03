@@ -117,17 +117,20 @@ Follow these key principles:
 1. Extract Only What Is Explicitly Stated
    - Avoid assumptions. Only create relationships and facts clearly mentioned in the text.
 
-2. Self-References
-   - When the user says "I," "me," "my," and so on, treat it as "USER_ID" or the designated user node.
+2. Self-References & Collective Pronouns
+   - When the user says "I," "me," "my," treat it as "USER_ID" or the designated user node.
+   - When the user says "we," "us," "our," identify all participants mentioned in the context and create relationships for each participant performing the same action.
+   - If "we" includes the user and others, treat the user as "USER_ID" and create separate facts for each named participant.
 
 3. Node Labeling
    - Use a defined or consistently updated set of labels (e.g., Person, Organization, Location, Emotion, Concept) that accurately reflect each entity's type.
    - If an entity fits multiple categories or subcategories, apply additional labels as appropriate, ensuring consistency with any existing labeling conventions.
    - Keep each labeled entry concise yet comprehensive, so future queries can easily distinguish entity types.
 
-4. Relationships
+4. Relationships  
    - Use consistent, general, and timeless relationship types rather than time-bound or event-specific forms (e.g., prefer "professor" over "became_professor").
    - Establish relationships only among entities explicitly mentioned in the user's message.
+   - Infer implicit relationships: family members (has_sibling, has_parent), companions in activities (going_with), social connections (is_friend_of).
 
 5. Uncertainty
    - If the user expresses uncertainty (e.g., "I might move to London or Berlin"), capture it with an `is_uncertain=true` or a lower weight.
@@ -171,7 +174,13 @@ Follow these key principles:
 11. Do Not Summarize
     - Output only the JSON. If no facts can be extracted, return {"facts": []}.
 
-12. Examples
+12. Collective Activities & Shared Actions
+    - "We," "us," "together," "with [person]" → create separate relationship facts for each participant doing the same action
+    - "We both [verb]," "we all [verb]" → identical relationships for all mentioned participants  
+    - Collective activities always need companion relationships (going_with, accompanied_by)
+    - Family/social relationships should be inferred when people do activities together (has_sibling, is_friend_of)
+
+13. Examples
 
 Example A:
 Input:
@@ -453,6 +462,77 @@ Explanation:
 - Rich emotional vocabulary: "enthusiastic", "grateful", "content", "frustrated", "longing"
 - Each relationship captures the specific emotional nuance of that connection
 
+
+Example F (Collective Activities):
+Input:
+"We are planning to go swimming tomorrow with john, since its my off day."
+
+Expected Output:
+{
+  "facts": [
+    {
+      "source": "USER_ID",
+      "relationship": "planning_to_go",
+      "destination": "swimming",
+      "weight": "important",
+      "labels": {
+        "source": "Person",
+        "destination": "Activity"
+      },
+      "emotion": "excited"
+    },
+    {
+      "source": "john",
+      "relationship": "planning_to_go", 
+      "destination": "swimming",
+      "weight": "important",
+      "labels": {
+        "source": "Person",
+        "destination": "Activity"
+      },
+      "emotion": "excited"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "going_with",
+      "destination": "john",
+      "weight": "important", 
+      "labels": {
+        "source": "Person",
+        "destination": "Person"
+      },
+      "emotion": "friendly"
+    },
+    {
+      "source": "swimming",
+      "relationship": "scheduled_for",
+      "destination": "tomorrow",
+      "weight": "relevant",
+      "labels": {
+        "source": "Activity", 
+        "destination": "Time"
+      },
+      "emotion": "neutral"
+    },
+    {
+      "source": "USER_ID",
+      "relationship": "has",
+      "destination": "off_day",
+      "weight": "important",
+      "labels": {
+        "source": "Person",
+        "destination": "Concept"
+      },
+      "emotion": "content"
+    }
+  ]
+}
+
+Explanation:
+- "We are planning" creates separate planning relationships for both USER_ID and john
+- Going "with john" creates a companion relationship  
+- All participants in collective activities get individual relationship facts
+- The system recognizes that collective pronouns require distributing actions across all mentioned participants
 """
 
 DELETE_RELATIONS_SYSTEM_PROMPT = """
