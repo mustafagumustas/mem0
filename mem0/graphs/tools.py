@@ -18,6 +18,39 @@ UPDATE_MEMORY_TOOL_GRAPH = {
                     "type": "string",
                     "description": "The new or updated relationship between the source and destination nodes. This should be a concise, clear description of how the two nodes are connected.",
                 },
+                "weight": {
+                    "type": "string",
+                    "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                    "description": "The significance category of this relationship to the user.",
+                },
+                "is_uncertain": {
+                    "type": "boolean",
+                    "description": "Indicates whether this relationship is uncertain or speculative.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                },
+                "last_mentioned": {
+                    "type": "string",
+                    "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                },
+                "usage_count": {
+                    "type": "integer",
+                    "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
+                },
             },
             "required": ["source", "destination", "relationship"],
             "additionalProperties": False,
@@ -52,6 +85,39 @@ ADD_MEMORY_TOOL_GRAPH = {
                 "destination_type": {
                     "type": "string",
                     "description": "The type or category of the destination node. This helps in classifying and organizing nodes in the graph.",
+                },
+                "weight": {
+                    "type": "string",
+                    "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                    "description": "The significance category of this relationship to the user.",
+                },
+                "is_uncertain": {
+                    "type": "boolean",
+                    "description": "Indicates whether this relationship is uncertain or speculative.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                },
+                "last_mentioned": {
+                    "type": "string",
+                    "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                },
+                "usage_count": {
+                    "type": "integer",
+                    "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                 },
             },
             "required": [
@@ -95,7 +161,10 @@ RELATIONS_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "source": {"type": "string", "description": "The source entity of the relationship."},
+                            "source": {
+                                "type": "string",
+                                "description": "The source entity of the relationship.",
+                            },
                             "relationship": {
                                 "type": "string",
                                 "description": "The relationship between the source and destination entities.",
@@ -103,6 +172,39 @@ RELATIONS_TOOL = {
                             "destination": {
                                 "type": "string",
                                 "description": "The destination entity of the relationship.",
+                            },
+                            "weight": {
+                                "type": "string",
+                                "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                                "description": "The significance category of this relationship to the user.",
+                            },
+                            "is_uncertain": {
+                                "type": "boolean",
+                                "description": "Indicates whether this relationship is uncertain or speculative.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                            },
+                            "start_date": {
+                                "type": "string",
+                                "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                            },
+                            "emotion": {
+                                "type": "string",
+                                "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                            },
+                            "last_mentioned": {
+                                "type": "string",
+                                "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                            },
+                            "usage_count": {
+                                "type": "integer",
+                                "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                             },
                         },
                         "required": [
@@ -134,8 +236,14 @@ EXTRACT_ENTITIES_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "entity": {"type": "string", "description": "The name or identifier of the entity."},
-                            "entity_type": {"type": "string", "description": "The type or category of the entity."},
+                            "entity": {
+                                "type": "string",
+                                "description": "The name or identifier of the entity.",
+                            },
+                            "entity_type": {
+                                "type": "string",
+                                "description": "The type or category of the entity.",
+                            },
                         },
                         "required": ["entity", "entity_type"],
                         "additionalProperties": False,
@@ -169,6 +277,39 @@ UPDATE_MEMORY_STRUCT_TOOL_GRAPH = {
                 "relationship": {
                     "type": "string",
                     "description": "The new or updated relationship between the source and destination nodes. This should be a concise, clear description of how the two nodes are connected.",
+                },
+                "weight": {
+                    "type": "string",
+                    "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                    "description": "The significance category of this relationship to the user.",
+                },
+                "is_uncertain": {
+                    "type": "boolean",
+                    "description": "Indicates whether this relationship is uncertain or speculative.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                },
+                "last_mentioned": {
+                    "type": "string",
+                    "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                },
+                "usage_count": {
+                    "type": "integer",
+                    "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                 },
             },
             "required": ["source", "destination", "relationship"],
@@ -205,6 +346,39 @@ ADD_MEMORY_STRUCT_TOOL_GRAPH = {
                 "destination_type": {
                     "type": "string",
                     "description": "The type or category of the destination node. This helps in classifying and organizing nodes in the graph.",
+                },
+                "weight": {
+                    "type": "string",
+                    "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                    "description": "The significance category of this relationship to the user.",
+                },
+                "is_uncertain": {
+                    "type": "boolean",
+                    "description": "Indicates whether this relationship is uncertain or speculative.",
+                },
+                "status": {
+                    "type": "string",
+                    "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                },
+                "last_mentioned": {
+                    "type": "string",
+                    "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                },
+                "usage_count": {
+                    "type": "integer",
+                    "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                 },
             },
             "required": [
@@ -261,6 +435,39 @@ RELATIONS_STRUCT_TOOL = {
                                 "type": "string",
                                 "description": "The destination entity of the relationship.",
                             },
+                            "weight": {
+                                "type": "string",
+                                "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                                "description": "The significance category of this relationship to the user.",
+                            },
+                            "is_uncertain": {
+                                "type": "boolean",
+                                "description": "Indicates whether this relationship is uncertain or speculative.",
+                            },
+                            "status": {
+                                "type": "string",
+                                "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
+                            },
+                            "start_date": {
+                                "type": "string",
+                                "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
+                            },
+                            "end_date": {
+                                "type": "string",
+                                "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
+                            },
+                            "emotion": {
+                                "type": "string",
+                                "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
+                            },
+                            "last_mentioned": {
+                                "type": "string",
+                                "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
+                            },
+                            "usage_count": {
+                                "type": "integer",
+                                "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
+                            },
                         },
                         "required": [
                             "source_entity",
@@ -292,8 +499,14 @@ EXTRACT_ENTITIES_STRUCT_TOOL = {
                     "items": {
                         "type": "object",
                         "properties": {
-                            "entity": {"type": "string", "description": "The name or identifier of the entity."},
-                            "entity_type": {"type": "string", "description": "The type or category of the entity."},
+                            "entity": {
+                                "type": "string",
+                                "description": "The name or identifier of the entity.",
+                            },
+                            "entity_type": {
+                                "type": "string",
+                                "description": "The type or category of the entity.",
+                            },
                         },
                         "required": ["entity", "entity_type"],
                         "additionalProperties": False,
@@ -368,4 +581,47 @@ DELETE_MEMORY_TOOL_GRAPH = {
             "additionalProperties": False,
         },
     },
+}
+
+ANALYZE_RELATION_EVOLUTION_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "analyze_relation_evolution",
+        "description": "Infer behavioral and emotional changes in a user's relationship with an entity based on recent conversation history and graph context.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "weight": {
+                    "type": "string",
+                    "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
+                    "description": "Updated significance category representing how much this relationship matters to the user."
+                },
+                "emotion": {
+                    "type": "string",
+                    "description": "Updated emotional tone of the relationship. For example, if a user expresses frustration about something they previously liked, the emotion could change from 'joy' to 'annoyance'."
+                },
+                "status": {
+                    "type": "string",
+                    "description": "Updated status: 'active', 'ended', or 'invalid'. For example, if a user says they've stopped a hobby, the status could become 'ended'."
+                },
+                "is_uncertain": {
+                    "type": "boolean",
+                    "description": "True if the emotional shift is unclear or speculative. This is for when you are not confident in the analysis."
+                },
+                "has_emotional_shift": {
+                    "type": "boolean",
+                    "description": "True if the user's emotional tone towards the entity has changed significantly."
+                },
+                "has_habit_changed": {
+                    "type": "boolean",
+                    "description": "True if the user's behavior or habits related to the entity have changed, e.g., frequency of mention."
+                },
+                "has_new_obsession": {
+                    "type": "boolean",
+                    "description": "True if a new interest seems to be displacing this entity in the user's focus."
+                }
+            },
+            "required": ["weight", "emotion", "status", "is_uncertain", "has_emotional_shift", "has_habit_changed", "has_new_obsession"]
+        }
+    }
 }
