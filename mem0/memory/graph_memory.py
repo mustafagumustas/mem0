@@ -454,16 +454,7 @@ Return updated weight, emotion, status, and analysis flags."""
             messages=[
                 {
                     "role": "system",
-                    "content": f"""You are a smart assistant who understands entities and their types in a given text.
-
-Pronoun Resolution Rules:
-- First-person: If text contains 'I', 'me', 'my', 'myself' etc., use {filters['user_id']} as the entity
-- Third-person: For 'he', 'she', 'they', 'him', 'her', 'them', resolve to the actual person mentioned in the context
-- NEVER extract literal pronouns as entities. Do not create entities named 'i', 'me', 'my', 'he', 'she', 'they', 'him', 'her', 'them'
-- If a pronoun cannot be resolved from context, skip that entity entirely
-- Keep individual people separate - avoid composite names like 'john_mary'
-
-Extract all entities from the text with their types. ***DO NOT*** answer questions.""",
+                    "content": f"You are a smart assistant who understands entities and their types in a given text. If user message contains self reference such as 'I', 'me', 'my' etc. then use {filters['user_id']} as the source entity. Extract all the entities from the text. ***DO NOT*** answer the question itself if the given text is a question.",
                 },
                 {"role": "user", "content": data},
             ],
@@ -1050,21 +1041,11 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         Process entities by:
         1. Converting entity names to lowercase and replacing spaces with underscores
         2. Ensuring all required parameters are present with default values if missing
-        3. Filter out any literal pronoun nodes that slipped through
         """
-        # Pronouns that should never become nodes
-        PRONOUN_BLACKLIST = {'i', 'me', 'my', 'myself', 'he', 'she', 'they', 'him', 'her', 'them', 'his', 'hers', 'their', 'theirs'}
-        
-        filtered_entities = []
         for item in entity_list:
             item["source"] = item["source"].lower().replace(" ", "_")
             item["relationship"] = item["relationship"].lower().replace(" ", "_")
             item["destination"] = item["destination"].lower().replace(" ", "_")
-
-            # Filter out relationships with pronoun nodes
-            if item["source"] in PRONOUN_BLACKLIST or item["destination"] in PRONOUN_BLACKLIST:
-                logger.warning(f"Filtered out pronoun relationship: {item['source']} -> {item['relationship']} -> {item['destination']}")
-                continue
 
             # Ensure all required parameters are present with default values if missing
             if "weight" not in item or item["weight"] is None:
@@ -1091,10 +1072,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             # Optional date parameters - no defaults for these
             # start_date and end_date can remain null
 
-            # Add to filtered list if it passed all checks
-            filtered_entities.append(item)
-
-        return filtered_entities
+        return entity_list
 
     def _search_source_node(self, source_embedding, user_id, threshold=0.9):
         cypher = """
