@@ -1461,6 +1461,134 @@ Return updated weight, emotion, status, and analysis flags."""
         
         return results
 
+    def get_role_candidates(self, user_id, normalized_role, side="source"):
+        """
+        Retrieve candidate entities from the graph that match a given role relationship.
+        
+        Args:
+            user_id (str): User ID for filtering
+            normalized_role (str): The normalized role type (e.g., "best_friend", "sister", "roommate")
+            side (str): Either "source" or "destination" - indicates which side of the relationship to query
+            
+        Returns:
+            list: List of candidate dictionaries with keys:
+                - name: The entity name
+                - normalized_name: Lowercase version of the name
+                - relationship_type: The relationship type that matched
+                - element_id: Neo4j element ID of the entity
+                - weight: Relationship weight/importance
+                - status: Relationship status (active, ended, etc.)
+                
+        Example:
+            get_role_candidates("user123", "best_friend", "source")
+            # Returns people who have a "has_best_friend" relationship from USER_ID
+        """
+        # Map normalized roles to potential relationship types
+        # This mapping can be extended dynamically or configured
+        role_to_relationship_map = {
+            "best_friend": ["has_best_friend", "is_best_friend_of", "friend_of"],
+            "friend": ["friend_of", "is_friend_of", "friends_with"],
+            "brother": ["has_brother", "brother_of", "has_sibling"],
+            "sister": ["has_sister", "sister_of", "has_sibling"],
+            "sibling": ["has_sibling", "sibling_of"],
+            "mother": ["has_mother", "mother_of", "has_parent"],
+            "father": ["has_father", "father_of", "has_parent"],
+            "parent": ["has_parent", "parent_of"],
+            "child": ["has_child", "child_of", "parent_of"],
+            "son": ["has_son", "son_of", "has_child"],
+            "daughter": ["has_daughter", "daughter_of", "has_child"],
+            "roommate": ["lives_with", "roommate_of", "shares_apartment_with"],
+            "colleague": ["works_with", "colleague_of", "coworker_of"],
+            "manager": ["reports_to", "managed_by", "has_manager"],
+            "partner": ["partner_of", "in_relationship_with", "dating"],
+            "spouse": ["married_to", "spouse_of", "partner_of"],
+            "boyfriend": ["dating", "boyfriend_of", "in_relationship_with"],
+            "girlfriend": ["dating", "girlfriend_of", "in_relationship_with"],
+            "neighbor": ["neighbor_of", "lives_near", "next_door_to"],
+            "mentor": ["mentored_by", "has_mentor", "learns_from"],
+            "student": ["teaches", "mentors", "has_student"],
+            "boss": ["reports_to", "works_for", "employed_by"],
+            "employee": ["employs", "manages", "supervises"],
+        }
+        
+        # Get potential relationship types for this role
+        relationship_types = role_to_relationship_map.get(normalized_role, [normalized_role])
+        
+        # Build query based on side
+        if side == "source":
+            # Query: USER_ID -[relationship]-> Person
+            # Find entities where USER_ID has the role relationship TO them
+            cypher_query = """
+            MATCH (u {user_id: $user_id, name: $user_node_name})
+            -[r]->(p)
+            WHERE type(r) IN $relationship_types
+            AND p.user_id = $user_id
+            RETURN 
+                p.name AS name,
+                toLower(p.name) AS normalized_name,
+                type(r) AS relationship_type,
+                elementId(p) AS element_id,
+                r.weight AS weight,
+                r.status AS status,
+                r.emotion AS emotion,
+                r.last_mentioned AS last_mentioned
+            ORDER BY r.last_mentioned DESC, r.usage_count DESC
+            """
+            params = {
+                "user_id": user_id,
+                "user_node_name": user_id,  # Assuming user node is named with user_id
+                "relationship_types": relationship_types
+            }
+        else:  # side == "destination"
+            # Query: Person -[relationship]-> USER_ID
+            # Find entities that have the role relationship FROM them to USER_ID
+            cypher_query = """
+            MATCH (p)-[r]->(u {user_id: $user_id, name: $user_node_name})
+            WHERE type(r) IN $relationship_types
+            AND p.user_id = $user_id
+            RETURN 
+                p.name AS name,
+                toLower(p.name) AS normalized_name,
+                type(r) AS relationship_type,
+                elementId(p) AS element_id,
+                r.weight AS weight,
+                r.status AS status,
+                r.emotion AS emotion,
+                r.last_mentioned AS last_mentioned
+            ORDER BY r.last_mentioned DESC, r.usage_count DESC
+            """
+            params = {
+                "user_id": user_id,
+                "user_node_name": user_id,
+                "relationship_types": relationship_types
+            }
+        
+        try:
+            results = self.graph.query(cypher_query, params=params)
+            
+            candidates = []
+            for result in results:
+                # Filter out inactive relationships by default
+                status = result.get("status", "active")
+                if status in ["active", None]:  # Include active and relationships without status
+                    candidates.append({
+                        "name": result["name"],
+                        "normalized_name": result["normalized_name"],
+                        "relationship_type": result["relationship_type"],
+                        "element_id": result["element_id"],
+                        "weight": result.get("weight"),
+                        "status": status,
+                        "emotion": result.get("emotion"),
+                        "last_mentioned": result.get("last_mentioned")
+                    })
+            
+            logger.info(f"Found {len(candidates)} candidates for role '{normalized_role}' (side={side})")
+            return candidates
+            
+        except Exception as e:
+            logger.error(f"Error querying role candidates for '{normalized_role}': {e}")
+            return []
+
     def reset(self):
         """Reset the graph by clearing all nodes and relationships."""
         logger.warning("Clearing graph...")

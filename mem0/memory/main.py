@@ -80,6 +80,355 @@ class Memory(MemoryBase):
             logger.error(f"Configuration validation error: {e}")
             raise
 
+    def _extract_role_references(self, messages, filters):
+        """
+        Extract role references from messages using the LLM.
+        
+        Args:
+            messages (list): List of message dicts
+            filters (dict): Filters including user_id
+            
+        Returns:
+            dict: Result with keys:
+                - entities: List of explicit entities
+                - references: List of role references needing resolution
+        """
+        from mem0.graphs.tools import (
+            EXTRACT_ROLE_REFERENCES_TOOL,
+            EXTRACT_ROLE_REFERENCES_STRUCT_TOOL,
+        )
+        from mem0.graphs.utils import EXTRACT_ROLE_REFERENCES_PROMPT
+        
+        # Aggregate only user/assistant messages (not system)
+        content_to_analyze = "\n".join([
+            msg["content"] for msg in messages 
+            if msg.get("role") not in ["system"] and "content" in msg
+        ])
+        
+        if not content_to_analyze.strip():
+            return {"entities": [], "references": []}
+        
+        # Select tool based on LLM provider
+        _tools = [EXTRACT_ROLE_REFERENCES_TOOL]
+        if self.config.llm.provider in ["azure_openai_structured", "openai_structured"]:
+            _tools = [EXTRACT_ROLE_REFERENCES_STRUCT_TOOL]
+        
+        try:
+            # Call LLM with role reference extraction tool
+            response = self.llm.generate_response(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": EXTRACT_ROLE_REFERENCES_PROMPT.replace("USER_ID", filters.get("user_id", "user"))
+                    },
+                    {
+                        "role": "user",
+                        "content": content_to_analyze
+                    }
+                ],
+                tools=_tools
+            )
+            
+            # Parse the tool call response
+            if response and response.get("tool_calls"):
+                tool_call = response["tool_calls"][0]
+                if tool_call["name"] == "extract_role_references":
+                    result = tool_call["arguments"]
+                    logger.info(f"Extracted {len(result.get('entities', []))} entities and {len(result.get('references', []))} role references")
+                    return result
+            
+            # No tool call or unexpected response
+            logger.warning("No role references extracted from LLM response")
+            return {"entities": [], "references": []}
+            
+        except Exception as e:
+            logger.error(f"Error extracting role references: {e}")
+            return {"entities": [], "references": []}
+
+    def _rewrite_messages_with_resolved_names(self, messages, resolved_references):
+        """
+        Rewrite messages by replacing role references with their canonical resolved names.
+        
+        Args:
+            messages (list): List of message dicts
+            resolved_references (list): List of resolution result dicts with:
+                - reference: The original reference dict
+                - resolved_name: The canonical name to use
+                
+        Returns:
+            list: New list of messages with references replaced
+        """
+        rewritten_messages = []
+        
+        for message in messages:
+            if "content" not in message or message.get("role") == "system":
+                rewritten_messages.append(message.copy())
+                continue
+            
+            content = message["content"]
+            
+            # Replace each resolved reference with its canonical name
+            for res_ref in resolved_references:
+                if res_ref["status"] == "resolved" and "resolved_name" in res_ref:
+                    reference = res_ref["reference"]
+                    raw_text = reference["raw_text"]
+                    resolved_name = res_ref["resolved_name"]
+                    
+                    # Replace the raw text span with the resolved name
+                    # Case-insensitive replacement
+                    import re
+                    pattern = re.compile(re.escape(raw_text), re.IGNORECASE)
+                    content = pattern.sub(resolved_name, content)
+                    
+                    logger.debug(f"Rewrote '{raw_text}' -> '{resolved_name}' in message")
+            
+            # Create new message with rewritten content
+            rewritten_message = message.copy()
+            rewritten_message["content"] = content
+            rewritten_messages.append(rewritten_message)
+        
+        return rewritten_messages
+
+    def _resolve_from_vector(self, reference, filters, limit=5):
+        """
+        Attempt to resolve a role reference using vector store search.
+        
+        Args:
+            reference (dict): Reference dict with keys: raw_text, normalized_role, normalized_entity, side
+            filters (dict): Search filters (user_id, agent_id, run_id)
+            limit (int): Maximum number of results to search
+            
+        Returns:
+            list: List of candidate dicts with keys: name, normalized_name, source
+        """
+        candidates = []
+        
+        # Search using the role phrase
+        query = f"{reference['normalized_entity']} {reference['normalized_role']}"
+        
+        try:
+            query_embedding = self.embedding_model.embed(query, "search")
+            search_results = self.vector_store.search(
+                query=query,
+                vectors=query_embedding,
+                limit=limit,
+                filters=filters
+            )
+            
+            # Extract potential names from the results
+            import re
+            for result in search_results:
+                data = result.payload.get("data", "")
+                
+                # Simple heuristic: extract capitalized words that might be names
+                # This is a basic approach - could be improved with NER
+                words = re.findall(r'\b[A-Z][a-z]+\b', data)
+                
+                for word in words:
+                    # Avoid common non-name words
+                    if word.lower() not in ["i", "the", "a", "an", "this", "that", "user_id"]:
+                        candidates.append({
+                            "name": word,
+                            "normalized_name": word.lower(),
+                            "source": "vector",
+                            "score": result.score if hasattr(result, 'score') else 0.0,
+                            "context": data[:100]  # Store some context
+                        })
+            
+            # Deduplicate by normalized name
+            seen = {}
+            unique_candidates = []
+            for candidate in candidates:
+                if candidate["normalized_name"] not in seen:
+                    seen[candidate["normalized_name"]] = True
+                    unique_candidates.append(candidate)
+            
+            logger.info(f"Found {len(unique_candidates)} vector candidates for '{reference['raw_text']}'")
+            return unique_candidates
+            
+        except Exception as e:
+            logger.error(f"Error in vector-based role resolution: {e}")
+            return []
+
+    def _render_clarification_question(self, role, candidates, side="source"):
+        """
+        Render a natural language clarification question.
+        
+        Args:
+            role (str): The normalized role (e.g., "best_friend")
+            candidates (list): List of candidate dicts with at least a "name" key
+            side (str): "source" or "destination"
+            
+        Returns:
+            str: A natural language question asking for clarification
+        """
+        # Convert role from snake_case to readable form
+        readable_role = role.replace("_", " ")
+        
+        if len(candidates) == 0:
+            # No candidates found - ask for new information
+            return f"I don't have any information about your {readable_role}. Could you tell me who your {readable_role} is?"
+        
+        elif len(candidates) == 1:
+            # Single candidate but we want confirmation
+            return f"By '{readable_role}', do you mean {candidates[0]['name']}?"
+        
+        else:
+            # Multiple candidates - ask which one
+            names = [c["name"] for c in candidates]
+            if len(names) == 2:
+                names_str = f"{names[0]} or {names[1]}"
+            else:
+                names_str = ", ".join(names[:-1]) + f", or {names[-1]}"
+            
+            return f"I found multiple people who match '{readable_role}': {names_str}. Which {readable_role} were you referring to?"
+
+    def _resolve_role_references(self, messages, references, filters):
+        """
+        Resolve role references against graph and vector store.
+        
+        Args:
+            messages (list): List of message dicts
+            references (list): List of reference dicts from role extraction
+            filters (dict): Filters including user_id
+            
+        Returns:
+            dict: Resolution result with structure:
+                - status: "resolved", "clarification_needed", or "error"
+                - resolved_references: List of successfully resolved references (if status="resolved")
+                - clarification: Clarification payload (if status="clarification_needed")
+        """
+        if not references:
+            return {"status": "resolved", "resolved_references": []}
+        
+        resolution_results = []
+        
+        for reference in references:
+            # Skip if this doesn't need resolution (explicit entity already present)
+            if reference.get("normalized_entity") not in ["USER_ID", "he", "she", "they", "it"]:
+                # This is already a specific entity, not a role reference needing resolution
+                resolution_results.append({
+                    "reference": reference,
+                    "status": "explicit",
+                    "candidates": []
+                })
+                continue
+            
+            # Replace USER_ID with actual user_id for graph queries
+            query_entity = filters["user_id"] if reference["normalized_entity"] == "USER_ID" else reference["normalized_entity"]
+            
+            graph_candidates = []
+            if self.enable_graph:
+                try:
+                    graph_candidates = self.graph.get_role_candidates(
+                        user_id=filters["user_id"],
+                        normalized_role=reference["normalized_role"],
+                        side=reference.get("side", "source")
+                    )
+                except Exception as e:
+                    logger.error(f"Error getting graph candidates: {e}")
+            
+            # Optionally combine with vector evidence
+            vector_candidates = self._resolve_from_vector(reference, filters, limit=5)
+            
+            # Merge candidates (prioritize graph, but include vector if graph is empty)
+            all_candidates = graph_candidates.copy()
+            
+            # Add vector candidates that aren't already in graph candidates
+            graph_names = {c["normalized_name"] for c in graph_candidates}
+            for vc in vector_candidates:
+                if vc["normalized_name"] not in graph_names:
+                    all_candidates.append(vc)
+            
+            # Deduplicate and normalize
+            unique_candidates = []
+            seen_names = set()
+            for candidate in all_candidates:
+                norm_name = candidate["normalized_name"]
+                if norm_name not in seen_names:
+                    seen_names.add(norm_name)
+                    unique_candidates.append(candidate)
+            
+            # Classify the result
+            num_candidates = len(unique_candidates)
+            
+            if num_candidates == 0:
+                # Zero candidates - need clarification
+                resolution_results.append({
+                    "reference": reference,
+                    "status": "ambiguous",
+                    "candidates": [],
+                    "reason": "no_candidates"
+                })
+            elif num_candidates == 1:
+                # Exactly one candidate - resolved!
+                resolution_results.append({
+                    "reference": reference,
+                    "status": "resolved",
+                    "candidates": unique_candidates,
+                    "resolved_name": unique_candidates[0]["name"]
+                })
+            else:
+                # Multiple candidates - need clarification
+                resolution_results.append({
+                    "reference": reference,
+                    "status": "ambiguous",
+                    "candidates": unique_candidates,
+                    "reason": "multiple_candidates"
+                })
+        
+        # Check if any references need clarification
+        ambiguous_refs = [r for r in resolution_results if r["status"] == "ambiguous"]
+        
+        if ambiguous_refs:
+            # Build clarification payload for the first ambiguous reference
+            # (In a full implementation, you might handle multiple clarifications)
+            first_ambiguous = ambiguous_refs[0]
+            reference = first_ambiguous["reference"]
+            candidates = first_ambiguous["candidates"]
+            
+            clarification_id = str(uuid.uuid4())
+            message = self._render_clarification_question(
+                role=reference["normalized_role"],
+                candidates=candidates,
+                side=reference.get("side", "source")
+            )
+            
+            clarification_payload = {
+                "clarification": {
+                    "status": "pending",
+                    "clarification_id": clarification_id,
+                    "role": reference["normalized_role"],
+                    "side": reference.get("side", "source"),
+                    "trigger_span": reference["raw_text"],
+                    "candidates": [{"name": c["name"], "source": c.get("source", "graph")} for c in candidates],
+                    "message": message,
+                    "context": {
+                        "all_references": references,
+                        "ambiguous_count": len(ambiguous_refs)
+                    }
+                }
+            }
+            
+            # Log the clarification event
+            logger.info(f"Role clarification needed: {reference['raw_text']} -> {len(candidates)} candidates")
+            capture_event("mem0.role_clarification", self, {
+                "role": reference["normalized_role"],
+                "candidate_count": len(candidates),
+                "reason": first_ambiguous["reason"]
+            })
+            
+            return {
+                "status": "clarification_needed",
+                "clarification": clarification_payload
+            }
+        
+        # All references resolved successfully
+        return {
+            "status": "resolved",
+            "resolved_references": resolution_results
+        }
+
     def add(
         self,
         messages,
@@ -138,6 +487,29 @@ class Memory(MemoryBase):
             messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
         else:
             messages = parse_vision_messages(messages)
+
+        # Extract role references from messages before processing
+        role_references_result = self._extract_role_references(messages, filters)
+        
+        # If role references were found, attempt to resolve them
+        if role_references_result.get("references"):
+            resolution_result = self._resolve_role_references(
+                messages, 
+                role_references_result["references"], 
+                filters
+            )
+            
+            # If clarification is needed, return immediately without writing to memory
+            if resolution_result["status"] == "clarification_needed":
+                logger.info("Returning clarification request instead of storing memory")
+                return resolution_result["clarification"]
+            
+            # If resolved, rewrite messages with canonical names
+            if resolution_result["status"] == "resolved":
+                messages = self._rewrite_messages_with_resolved_names(
+                    messages, 
+                    resolution_result["resolved_references"]
+                )
 
         with concurrent.futures.ThreadPoolExecutor() as executor:
             future1 = executor.submit(self._add_to_vector_store, messages, metadata, filters, infer)

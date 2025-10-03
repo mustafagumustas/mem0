@@ -583,6 +583,139 @@ DELETE_MEMORY_TOOL_GRAPH = {
     },
 }
 
+EXTRACT_ROLE_REFERENCES_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "extract_role_references",
+        "description": "Extract entities and role references (pronouns, possessive references like 'my best friend', 'his brother') from the text. This tool identifies both explicit entities and implicit references that need resolution.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entity": {
+                                "type": "string",
+                                "description": "The name or identifier of the entity.",
+                            },
+                            "entity_type": {
+                                "type": "string",
+                                "description": "The type or category of the entity.",
+                            },
+                        },
+                        "required": ["entity", "entity_type"],
+                        "additionalProperties": False,
+                    },
+                    "description": "An array of explicit entities with their types.",
+                },
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "raw_text": {
+                                "type": "string",
+                                "description": "The exact text span containing the role reference (e.g., 'my best friend', 'her sister').",
+                            },
+                            "normalized_role": {
+                                "type": "string",
+                                "description": "The normalized role type (e.g., 'best_friend', 'sister', 'brother', 'roommate').",
+                            },
+                            "normalized_entity": {
+                                "type": "string",
+                                "description": "The normalized possessive entity (e.g., 'USER_ID' for 'my', actual name for third-person possessives).",
+                            },
+                            "side": {
+                                "type": "string",
+                                "enum": ["source", "destination"],
+                                "description": "Whether the reference is on the source side (possessor) or destination side (possessed) of the relationship.",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "description": "Optional confidence score between 0 and 1 for the reference extraction.",
+                            },
+                        },
+                        "required": ["raw_text", "normalized_role", "normalized_entity", "side"],
+                        "additionalProperties": False,
+                    },
+                    "description": "An array of role references that need resolution.",
+                },
+            },
+            "required": ["entities", "references"],
+            "additionalProperties": False,
+        },
+    },
+}
+
+EXTRACT_ROLE_REFERENCES_STRUCT_TOOL = {
+    "type": "function",
+    "function": {
+        "name": "extract_role_references",
+        "description": "Extract entities and role references (pronouns, possessive references like 'my best friend', 'his brother') from the text. This tool identifies both explicit entities and implicit references that need resolution.",
+        "strict": True,
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entities": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "entity": {
+                                "type": "string",
+                                "description": "The name or identifier of the entity.",
+                            },
+                            "entity_type": {
+                                "type": "string",
+                                "description": "The type or category of the entity.",
+                            },
+                        },
+                        "required": ["entity", "entity_type"],
+                        "additionalProperties": False,
+                    },
+                    "description": "An array of explicit entities with their types.",
+                },
+                "references": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "raw_text": {
+                                "type": "string",
+                                "description": "The exact text span containing the role reference (e.g., 'my best friend', 'her sister').",
+                            },
+                            "normalized_role": {
+                                "type": "string",
+                                "description": "The normalized role type (e.g., 'best_friend', 'sister', 'brother', 'roommate').",
+                            },
+                            "normalized_entity": {
+                                "type": "string",
+                                "description": "The normalized possessive entity (e.g., 'USER_ID' for 'my', actual name for third-person possessives).",
+                            },
+                            "side": {
+                                "type": "string",
+                                "enum": ["source", "destination"],
+                                "description": "Whether the reference is on the source side (possessor) or destination side (possessed) of the relationship.",
+                            },
+                            "confidence": {
+                                "type": "number",
+                                "description": "Optional confidence score between 0 and 1 for the reference extraction.",
+                            },
+                        },
+                        "required": ["raw_text", "normalized_role", "normalized_entity", "side"],
+                        "additionalProperties": False,
+                    },
+                    "description": "An array of role references that need resolution.",
+                },
+            },
+            "required": ["entities", "references"],
+            "additionalProperties": False,
+        },
+    },
+}
+
 ANALYZE_RELATION_EVOLUTION_TOOL = {
     "type": "function",
     "function": {

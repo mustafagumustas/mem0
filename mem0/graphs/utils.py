@@ -535,6 +535,98 @@ Explanation:
 - The system recognizes that collective pronouns require distributing actions across all mentioned participants
 """
 
+EXTRACT_ROLE_REFERENCES_PROMPT = """
+You are an expert at identifying both explicit entities and implicit role references (pronouns, possessive phrases) in text.
+
+Your task is to extract:
+1. **Entities**: Explicit named entities mentioned in the text (people, places, organizations, etc.)
+2. **References**: Implicit references using roles, pronouns, or possessive constructions that need resolution
+
+Guidelines for References:
+- Detect possessive constructions: "my best friend", "his sister", "her roommate", "their colleague"
+- Identify the possessor (normalized_entity): 
+  - For first-person possessives ("my", "mine") → use "USER_ID"
+  - For third-person possessives → extract the actual referenced entity name if available
+- Extract the role being referenced (normalized_role): "best_friend", "sister", "roommate", "colleague"
+- Determine the side:
+  - "source": the reference is on the possessor side (e.g., "my best friend went shopping" - USER_ID is source, best_friend is destination)
+  - "destination": the reference is on the possessed side (rare, e.g., "Sarah is my best friend" - USER_ID is destination, Sarah is source)
+- Provide confidence if uncertain about the extraction
+
+Examples:
+
+Input: "I went shopping with my best friend yesterday."
+Output:
+{
+  "entities": [],
+  "references": [
+    {
+      "raw_text": "my best friend",
+      "normalized_role": "best_friend",
+      "normalized_entity": "USER_ID",
+      "side": "source",
+      "confidence": 1.0
+    }
+  ]
+}
+
+Input: "My brother John works at Microsoft."
+Output:
+{
+  "entities": [
+    {"entity": "John", "entity_type": "Person"},
+    {"entity": "Microsoft", "entity_type": "Organization"}
+  ],
+  "references": [
+    {
+      "raw_text": "My brother John",
+      "normalized_role": "brother",
+      "normalized_entity": "USER_ID",
+      "side": "source",
+      "confidence": 1.0
+    }
+  ]
+}
+
+Input: "Sarah's roommate is moving out next month."
+Output:
+{
+  "entities": [
+    {"entity": "Sarah", "entity_type": "Person"}
+  ],
+  "references": [
+    {
+      "raw_text": "Sarah's roommate",
+      "normalized_role": "roommate",
+      "normalized_entity": "sarah",
+      "side": "source",
+      "confidence": 1.0
+    }
+  ]
+}
+
+Input: "He mentioned his colleague was promoted."
+Output:
+{
+  "entities": [],
+  "references": [
+    {
+      "raw_text": "his colleague",
+      "normalized_role": "colleague",
+      "normalized_entity": "he",
+      "side": "source",
+      "confidence": 0.7
+    }
+  ]
+}
+
+Important:
+- Always use "USER_ID" for first-person possessives
+- Normalize roles to snake_case (e.g., "best friend" → "best_friend")
+- Return empty arrays if no entities or references are found
+- Only extract references that need resolution (possessive constructions with roles)
+"""
+
 DELETE_RELATIONS_SYSTEM_PROMPT = """
 You are a graph memory manager specializing in identifying, managing, and optimizing relationships within graph-based memories. Your primary task is to analyze a list of existing relationships and determine which ones should be ended (or marked as invalid) based on new information.
 
