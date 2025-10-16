@@ -460,8 +460,15 @@ Pronoun Resolution Rules:
 - First-person: If text contains 'I', 'me', 'my', 'myself' etc., use {filters['user_id']} as the entity
 - Third-person: For 'he', 'she', 'they', 'him', 'her', 'them', resolve to the actual person mentioned in the context
 - NEVER extract literal pronouns as entities. Do not create entities named 'i', 'me', 'my', 'he', 'she', 'they', 'him', 'her', 'them'
-- If a pronoun cannot be resolved from context, skip that entity entirely
 - Keep individual people separate - avoid composite names like 'john_mary'
+- The primary user node ({filters['user_id']}) must always have entity_type 'person'.
+
+Contextual Labeling Rules:
+- Read the entire input and use every clue (roles, attributes, possessions, timing, setting) to infer the most fitting semantic category.
+- Assign an entity_type for every entity. Only use 'unknown' if you can find no contextual signal even after considering the whole input.
+- Use concise, single-word nouns that reflect the entity's nature (e.g., person, location, organization, object, product, vehicle, event, activity, time, concept, quantity). Stay consistent and do not invent hybrids or add parentheses.
+- Let the entity’s role in context guide the label: tangible things → object/product/vehicle; venues or physical settings → location/place; services or shops that users visit → location; actions or hobbies → activity; scheduled occurrences → event; dates, durations, or time expressions → time; abstract ideas or categories → concept.
+- Prefer the label that best captures how the entity is being discussed in this specific input, rather than relying only on its literal wording.
 
 Extract all entities from the text with their types. ***DO NOT*** answer questions.""",
                 },
