@@ -34,7 +34,8 @@ Guidelines:
 
 6. Relationship Refinement
    - Look for opportunities to refine relationship descriptions for greater precision or clarity.
-   - If an existing relationship is too generic (e.g., "connected_to"), and the new information indicates a more specific type (e.g., "colleague_of", "friend_of"), update the relationship accordingly.
+   - For role-based relationships (roommate, friend, colleague, manager, teammate, coach, etc.), use the has/is two-hop structure: USER_ID → has → role_node, then role_node → is → person. The role node is a reusable anchor.
+   - For non-role relationships (lives_in, works_at, owns, likes, enjoys, etc.), use direct edges as appropriate.
    - Align refined relationships with your established schema or naming conventions to maintain consistency.
 
 7. Checking & Merging Relationships
@@ -86,7 +87,7 @@ Example A:
 - New Graph Memory:
   - parkour -- part_of -- Another Forest
 
-ark the old relationship as ended or invalid, depending on whether it was once correct or never correct. Then you add or update the new relationship:
+Mark the old relationship as ended or invalid, depending on whether it was once correct or never correct. Then you add or update the new relationship:
 1. source: "parkour", old_relationship: "part_of", old_destination: "Belgrad Forest", status: "invalid", invalid_date: "2025-03-01"
 2. source: "parkour", new_relationship: "part_of", new_destination: "Another Forest", status: "active"
 
@@ -98,6 +99,20 @@ Example B:
 
 1. source: "caesar salad", new_relationship: "subtype_of", new_destination: "salad", status: "active"
 No existing relationship is removed unless the user claims a prior link was incorrect.
+
+Example C (Role-Anchor Pattern for Social Relationships):
+- Existing Graph Memories:
+  - USER_ID -- has -- friend
+  - friend -- is -- john
+- New Graph Memory:
+  - User mentions "my friend Sarah"
+
+Update steps:
+1. Reuse existing role anchor: The "friend" role node already exists
+2. Add new person to role: source: "friend", new_relationship: "is", new_destination: "sarah", status: "active"
+3. USER_ID → has → friend remains unchanged (only created once)
+
+Result: Single reusable "friend" role node with multiple "is" edges to john and sarah.
 
 16. Output
    - Provide a list of specific update instructions for each memory that needs adjusting. For example:
@@ -126,7 +141,6 @@ Follow these key principles:
      * Never create composite entity names like 'john_mary', 'anil_sibel', or 'user_and_friend' - emit separate relations per person
      * If a pronoun cannot be resolved from available context, mark the relationship as is_uncertain=true rather than creating a pronoun node
    - **Relationship Vocabulary**: Use consistent, canonical relationship types:
-     * Prefer symmetric relationships: use 'is_friend_of' bidirectionally rather than mixing 'friends_with', 'knows', etc.
      * Normalize similar relationships: 'likes', 'enjoys', 'loves' → choose one based on intensity
      * Use present tense, active voice: 'works_at' not 'worked_at', 'is_married_to' not 'was_married'
 
@@ -138,7 +152,25 @@ Follow these key principles:
 4. Relationships  
    - Use consistent, general, and timeless relationship types rather than time-bound or event-specific forms (e.g., prefer "professor" over "became_professor").
    - Establish relationships only among entities explicitly mentioned in the user's message.
-   - Infer implicit relationships: family members (has_sibling, has_parent), companions in activities (going_with), social connections (is_friend_of).
+
+4a. Role Entity Relationships (Critical Pattern)
+   - Any role entity MUST be linked in two hops:
+     1. Owner → has → Role (e.g., USER_ID → has → roommate)
+     2. Role → is → Person_Filling_Role (e.g., roommate → is → john)
+   - The role node MUST carry the "Role" label in the labels field.
+   - The owner and person retain their existing labels (typically "Person").
+   
+   REUSABILITY OF ROLE NODES:
+   - When the same role label applies to multiple individuals, you MUST reuse the same role entity and add multiple is edges.
+   - Example: "my roommate Alex" and "my roommate Jordan" → create ONE "roommate" role node with TWO is edges:
+     * USER_ID → has → roommate
+     * roommate → is → alex
+     * roommate → is → jordan
+   - Do NOT create "roommate_alex" and "roommate_jordan" as separate role nodes. The role anchor is shared; only the person changes.
+   - If temporal context differs (e.g., "former roommate" vs "current roommate"), extract temporal modifiers as separate entities (e.g., "former", "current") with their own relationships to the role, not as part of the role name.
+   
+   - Do NOT create additional direct edges between owner and person (e.g., owner → roommate_of → person) unless the text explicitly expresses another relationship beyond the role.
+   - This pattern applies to ALL relational designations: roommate, best_friend, coach, manager, teammate, barista, childhood_friend, colleague, neighbor, mentor, advisor, etc.
 
 5. Uncertainty
    - If the user expresses uncertainty (e.g., "I might move to London or Berlin"), capture it with an `is_uncertain=true` or a lower weight.
@@ -186,7 +218,7 @@ Follow these key principles:
     - "We," "us," "together," "with [person]" → create separate relationship facts for each participant doing the same action
     - "We both [verb]," "we all [verb]" → identical relationships for all mentioned participants  
     - Collective activities always need companion relationships (going_with, accompanied_by)
-    - Family/social relationships should be inferred when people do activities together (has_sibling, is_friend_of)
+    - Family/social relationships should be inferred when people do activities together 
 
 13. Examples
 
@@ -590,6 +622,26 @@ Explanation:
 - "He" in both instances resolves to "john" from the context
 - No literal pronoun nodes ('i', 'he') are created
 - All relationships use the resolved entity names
+
+Example G2 (Role Entity Pattern - Compact):
+Input: "My roommate Alex and my childhood friend Sarah both helped me move."
+
+Key role facts (showing pattern only):
+{
+  "facts": [
+    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "labels": {"source": "Person", "destination": "Role"}},
+    {"source": "roommate", "relationship": "is", "destination": "alex", "labels": {"source": "Role", "destination": "Person"}},
+    {"source": "USER_ID", "relationship": "has", "destination": "friend", "labels": {"source": "Person", "destination": "Role"}},
+    {"source": "friend", "relationship": "is", "destination": "sarah", "labels": {"source": "Role", "destination": "Person"}},
+    {"source": "friend", "relationship": "from_period", "destination": "childhood", "labels": {"source": "Role", "destination": "Time"}}
+  ]
+}
+
+Key points:
+- Role entities (roommate, friend) use entity_type "Role" and get label "Role"
+- Two-hop pattern: USER_ID → has → role_node → is → person
+- Temporal modifiers separate: "childhood friend" splits into "friend" role + "childhood" time entity
+- If later you see "my roommate Jordan", reuse the existing "roommate" node and add: roommate → is → jordan
 
 Example H (Entity Hygiene - Avoiding Composite Names):
 Input:

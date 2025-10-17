@@ -467,8 +467,16 @@ Contextual Labeling Rules:
 - Read the entire input and use every clue (roles, attributes, possessions, timing, setting) to infer the most fitting semantic category.
 - Assign an entity_type for every entity. Only use 'unknown' if you can find no contextual signal even after considering the whole input.
 - Use concise, single-word nouns that reflect the entity's nature (e.g., person, location, organization, object, product, vehicle, event, activity, time, concept, quantity). Stay consistent and do not invent hybrids or add parentheses.
-- Let the entity’s role in context guide the label: tangible things → object/product/vehicle; venues or physical settings → location/place; services or shops that users visit → location; actions or hobbies → activity; scheduled occurrences → event; dates, durations, or time expressions → time; abstract ideas or categories → concept.
+- Let the entity's role in context guide the label: tangible things → object/product/vehicle; venues or physical settings → location/place; services or shops that users visit → location; actions or hobbies → activity; scheduled occurrences → event; dates, durations, or time expressions → time; abstract ideas or categories → concept.
 - Prefer the label that best captures how the entity is being discussed in this specific input, rather than relying only on its literal wording.
+
+Role Entity Rules:
+- When a relational title is extracted (roommate, best_friend, coach, manager, teammate, barista, childhood_friend, colleague, neighbor, mentor, advisor, etc.), emit it as an entity with entity_type set to 'role'.
+- Normalize to the base role label: lowercase with underscores for spaces (e.g., "Best Friend" → "best_friend", "Team Coach" → "team_coach").
+- Do NOT attach temporal modifiers to role names. Strip them completely (e.g., "childhood friend" → extract "childhood" as separate time entity and "friend" as role entity; "former manager" → extract "former" as status/time indicator and "manager" as role entity).
+- Role entities represent reusable anchors that may connect to multiple people. A functionally identical role mention (e.g., multiple roommate references) should resolve to the SAME role node name.
+- Consistency is critical: if the user mentions "my roommate Alex" and later "my roommate Jordan", both should reference the entity "roommate" (not "roommate_alex" or "roommate_jordan").
+- Temporal or stage-of-life modifiers must be separate entities with entity_type 'time' or 'concept', linked via their own relationships.
 
 Extract all entities from the text with their types. ***DO NOT*** answer questions.""",
                 },
@@ -684,7 +692,18 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         return results
 
     def _add_entities(self, to_be_added, user_id, entity_type_map):
-        """Add the new entities to the graph. Merge the nodes if they already exist."""
+        """
+        Add the new entities to the graph. Merge the nodes if they already exist.
+        
+        CRITICAL: All MERGE operations use {name, user_id} as the matching criteria.
+        This ensures:
+        1. Role nodes are reused within a user's graph (e.g., multiple "roommate → is → person" edges share one "roommate" node)
+        2. Different users get independent role instances
+        3. Consistent entity naming from the LLM prompts enables proper node reusability
+        
+        For example, when the LLM emits "roommate" for both Alex and Jordan, the MERGE finds
+        the existing role node and adds a second "is" relationship, rather than creating duplicates.
+        """
         results = []
         logger.debug(f"Adding entities. `to_be_added`: {to_be_added}")
         for i, item in enumerate(to_be_added):
@@ -748,6 +767,8 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
+                # MERGE on {name, user_id} ensures role nodes are reused for this user
+                # E.g., "roommate" for Alex and Jordan will find the same role node
                 cypher = f"""
                     MATCH (source)
                     WHERE elementId(source) = $source_id
@@ -829,6 +850,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
+                # MERGE on {name, user_id} ensures role nodes are reused for this user
                 cypher = f"""
                     MATCH (destination)
                     WHERE elementId(destination) = $destination_id
@@ -992,6 +1014,8 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
+                # MERGE on {name, user_id} ensures role nodes are reused for this user
+                # Both source and destination can be role nodes that may already exist
                 cypher = f"""
                     MERGE (n:{source_type} {{name: $source_name, user_id: $user_id}})
                     ON CREATE SET 
