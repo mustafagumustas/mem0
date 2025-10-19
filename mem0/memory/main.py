@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from mem0.configs.base import MemoryConfig, MemoryItem
 from mem0.configs.prompts import get_update_memory_messages
 from mem0.memory.base import MemoryBase
+from mem0.memory.graph_memory import PersonDisambiguationException
 from mem0.memory.setup import setup_config
 from mem0.memory.storage import SQLiteManager
 from mem0.memory.telemetry import capture_event
@@ -114,8 +115,18 @@ class Memory(MemoryBase):
                 'add': added memory
                 'update': updated memory
                 'delete': deleted memory
-
-
+        
+        Raises:
+            AmbiguousPersonException: When the graph memory system detects multiple people
+                with the same name and cannot determine which one is being referenced.
+                The caller should catch this and prompt the user for clarification.
+            UnconfirmedPersonException: When the graph memory system cannot determine if
+                a person mention refers to an existing person or a new one.
+                The caller should catch this and ask the user to confirm.
+        
+        Note:
+            Graph additions are executed before vector store writes to maintain consistency.
+            If a PersonDisambiguationException is raised, no data is written to either store.
         """
         if metadata is None:
             metadata = {}
@@ -139,14 +150,24 @@ class Memory(MemoryBase):
         else:
             messages = parse_vision_messages(messages)
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future1 = executor.submit(self._add_to_vector_store, messages, metadata, filters, infer)
-            future2 = executor.submit(self._add_to_graph, messages, filters)
-
-            concurrent.futures.wait([future1, future2])
-
-            vector_store_result = future1.result()
-            graph_result = future2.result()
+        # Execute graph addition first to catch PersonDisambiguationException
+        # before committing to vector store (prevents store drift)
+        if self.enable_graph:
+            try:
+                graph_result = self._add_to_graph(messages, filters)
+            except PersonDisambiguationException:
+                # Re-raise immediately - don't write to vector store
+                # This includes both AmbiguousPersonException and UnconfirmedPersonException
+                raise
+            except Exception as e:
+                # For other exceptions, log and continue without graph
+                logger.error(f"Graph addition failed: {e}", exc_info=True)
+                graph_result = None
+        else:
+            graph_result = None
+        
+        # Only proceed with vector store if graph succeeded or isn't enabled
+        vector_store_result = self._add_to_vector_store(messages, metadata, filters, infer)
 
         if self.api_version == "v1.0":
             warnings.warn(

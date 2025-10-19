@@ -4,8 +4,52 @@ import pytz
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
+import uuid
 
 from mem0.memory.utils import format_entities
+
+
+class PersonDisambiguationException(Exception):
+    """Base exception for person disambiguation issues."""
+    pass
+
+
+class AmbiguousPersonException(PersonDisambiguationException):
+    """
+    Raised when multiple existing person nodes match the new data equally well.
+    
+    Attributes:
+        person_name: The name that's ambiguous
+        candidates: List of candidate profiles that matched
+        new_profile: The new person profile that couldn't be uniquely matched
+        message: Human-readable error message
+    """
+    def __init__(self, person_name, candidates, new_profile, message=None):
+        self.person_name = person_name
+        self.candidates = candidates
+        self.new_profile = new_profile
+        self.message = message or f"Multiple existing nodes match '{person_name}'. User clarification needed."
+        super().__init__(self.message)
+
+
+class UnconfirmedPersonException(PersonDisambiguationException):
+    """
+    Raised when no existing person node overlaps with the new data.
+    
+    This suggests it might be a new person, but confirmation is needed before creating a new node.
+    
+    Attributes:
+        person_name: The name in question
+        existing_count: Number of existing nodes with this name
+        new_profile: The new person profile
+        message: Human-readable error message
+    """
+    def __init__(self, person_name, existing_count, new_profile, message=None):
+        self.person_name = person_name
+        self.existing_count = existing_count
+        self.new_profile = new_profile
+        self.message = message or f"No overlap found for '{person_name}' with {existing_count} existing node(s). Is this a new person?"
+        super().__init__(self.message)
 
 try:
     from langchain_neo4j import Neo4jGraph
@@ -179,6 +223,25 @@ Return updated weight, emotion, status, and analysis flags."""
         Args:
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
+        
+        Returns:
+            dict: Dictionary with "updated_entities" and "added_entities" lists.
+        
+        Raises:
+            AmbiguousPersonException: When multiple existing person nodes match the new data equally well.
+                The exception contains candidates for user to choose from.
+            UnconfirmedPersonException: When no existing person node overlaps with new data.
+                The exception indicates confirmation is needed before creating a new person node.
+        
+        Note:
+            These exceptions should be caught by the caller to prompt the user for disambiguation.
+            For example:
+                try:
+                    result = memory_graph.add(data, filters)
+                except AmbiguousPersonException as e:
+                    # Ask user: "Which {e.person_name} do you mean: {describe candidates}?"
+                except UnconfirmedPersonException as e:
+                    # Ask user: "Is this a new person named {e.person_name}?"
         """
         # Step 1: Retrieve nodes from data
         entity_type_map = self._retrieve_nodes_from_data(data, filters)
@@ -212,9 +275,9 @@ Return updated weight, emotion, status, and analysis flags."""
         
         updated_entities.extend(evolution_updates)
         
-        # Step 7: Add entities
+        # Step 7: Add entities (pass search_output for person profile matching)
         added_entities = self._add_entities(
-            to_be_added, filters["user_id"], entity_type_map
+            to_be_added, filters["user_id"], entity_type_map, search_output
         )
 
         return {"updated_entities": updated_entities, "added_entities": added_entities}
@@ -312,6 +375,12 @@ Return updated weight, emotion, status, and analysis flags."""
                         "destination": item[2],
                     }
 
+                    # Add person_uid if present (for person nodes)
+                    if orig_item.get("source_person_uid"):
+                        result_dict["source_person_uid"] = orig_item["source_person_uid"]
+                    if orig_item.get("destination_person_uid"):
+                        result_dict["destination_person_uid"] = orig_item["destination_person_uid"]
+
                     # Add optional parameters if they exist
                     if orig_item.get("weight") is not None:
                         result_dict["weight"] = orig_item["weight"]
@@ -385,9 +454,13 @@ Return updated weight, emotion, status, and analysis flags."""
         query = """
         MATCH (n {user_id: $user_id})-[r]->(m {user_id: $user_id})
         RETURN 
-            n.name AS source, 
+            n.name AS source,
+            n.person_uid AS source_person_uid,
+            labels(n) AS source_labels,
             type(r) AS relationship, 
             m.name AS target,
+            m.person_uid AS target_person_uid,
+            labels(m) AS target_labels,
             r.weight AS weight,
             r.is_uncertain AS is_uncertain,
             r.status AS status,
@@ -412,6 +485,12 @@ Return updated weight, emotion, status, and analysis flags."""
                 "relationship": result["relationship"],
                 "target": result["target"],
             }
+            
+            # Add person_uid if present (for person nodes)
+            if result.get("source_person_uid"):
+                result_dict["source_person_uid"] = result["source_person_uid"]
+            if result.get("target_person_uid"):
+                result_dict["target_person_uid"] = result["target_person_uid"]
 
             # Add optional parameters if they exist in the result
             if result.get("weight") is not None:
@@ -592,24 +671,28 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         CALL (n) {
             MATCH (n)-[r]->(m)
             WHERE m.user_id = $user_id
-            RETURN n.name AS source, elementId(n) AS source_id, type(r) AS relatationship,
-                   elementId(r) AS relation_id, m.name AS destination, elementId(m) AS destination_id,
+            RETURN n.name AS source, elementId(n) AS source_id, labels(n) AS source_labels, n.person_uid AS source_person_uid,
+                   type(r) AS relatationship, elementId(r) AS relation_id, 
+                   m.name AS destination, elementId(m) AS destination_id, labels(m) AS destination_labels, m.person_uid AS destination_person_uid,
                    r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
                    r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
                    r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
             UNION
             MATCH (m)-[r]->(n)
             WHERE m.user_id = $user_id
-            RETURN m.name AS source, elementId(m) AS source_id, type(r) AS relatationship,
-                   elementId(r) AS relation_id, n.name AS destination, elementId(n) AS destination_id,
+            RETURN m.name AS source, elementId(m) AS source_id, labels(m) AS source_labels, m.person_uid AS source_person_uid,
+                   type(r) AS relatationship, elementId(r) AS relation_id,
+                   n.name AS destination, elementId(n) AS destination_id, labels(n) AS destination_labels, n.person_uid AS destination_person_uid,
                    r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
                    r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
                    r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
         }
         // Step 4: De-duplicate and return the final results with all rich metadata.
-        WITH DISTINCT source, source_id, relatationship, relation_id, destination, destination_id, similarity,
+        WITH DISTINCT source, source_id, source_labels, source_person_uid, relatationship, relation_id, 
+             destination, destination_id, destination_labels, destination_person_uid, similarity,
              weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
-        RETURN source, source_id, relatationship, relation_id, destination, destination_id, similarity,
+        RETURN source, source_id, source_labels, source_person_uid, relatationship, relation_id, 
+               destination, destination_id, destination_labels, destination_person_uid, similarity,
                weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
         """
 
@@ -691,7 +774,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         logger.debug(f"Updated relationships: {results}")
         return results
 
-    def _add_entities(self, to_be_added, user_id, entity_type_map):
+    def _add_entities(self, to_be_added, user_id, entity_type_map, search_output):
         """
         Add the new entities to the graph. Merge the nodes if they already exist.
         
@@ -701,11 +784,143 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         2. Different users get independent role instances
         3. Consistent entity naming from the LLM prompts enables proper node reusability
         
+        For person nodes specifically, we use person_uid to disambiguate between multiple people with the same name.
+        The person identifier system:
+        1. Builds profiles of existing person nodes based on their relationships
+        2. Builds profiles of new person mentions from to_be_added
+        3. Compares profiles to decide whether to reuse an existing node or create a new one
+        4. Assigns person_uid when creating new person nodes
+        
         For example, when the LLM emits "roommate" for both Alex and Jordan, the MERGE finds
         the existing role node and adds a second "is" relationship, rather than creating duplicates.
         """
         results = []
         logger.debug(f"Adding entities. `to_be_added`: {to_be_added}")
+        
+        # Build existing person profiles from search output
+        existing_person_profiles = self._build_person_profiles(search_output, entity_type_map)
+        logger.debug(f"Existing person profiles: {list(existing_person_profiles.keys())}")
+        
+        # Build new person profiles from to_be_added using the same flattened structure
+        # This ensures consistency with existing profiles built from search_output
+        new_person_profiles = {}
+        for item in to_be_added:
+            source = item["source"]
+            destination = item["destination"]
+            relationship = item["relationship"]
+            
+            source_type = entity_type_map.get(source, "unknown")
+            dest_type = entity_type_map.get(destination, "unknown")
+            
+            # Build profile for source if it's a person
+            if source_type == "person":
+                if source not in new_person_profiles:
+                    new_person_profiles[source] = {
+                        "person_uid": None,  # Will be assigned if we create a new node
+                        "element_id": None,
+                        "name": source,
+                        "facts": []  # Flattened list of fact records
+                    }
+                
+                # Build outgoing fact record
+                fact_record = {
+                    "direction": "out",
+                    "relationship": relationship,
+                    "target_name": destination,
+                    "target_uid": None,  # Will be filled if destination is also a new person with UID
+                    "target_type": dest_type,
+                    "metadata": {
+                        "weight": item.get("weight"),
+                        "is_uncertain": item.get("is_uncertain"),
+                        "status": item.get("status"),
+                        "emotion": item.get("emotion"),
+                        "start_date": item.get("start_date"),
+                        "end_date": item.get("end_date"),
+                    }
+                }
+                new_person_profiles[source]["facts"].append(fact_record)
+            
+            # Build profile for destination if it's a person
+            if dest_type == "person":
+                if destination not in new_person_profiles:
+                    new_person_profiles[destination] = {
+                        "person_uid": None,
+                        "element_id": None,
+                        "name": destination,
+                        "facts": []
+                    }
+                
+                # Build incoming fact record
+                fact_record = {
+                    "direction": "in",
+                    "relationship": relationship,
+                    "target_name": source,
+                    "target_uid": None,  # Will be filled if source is also a new person with UID
+                    "target_type": source_type,
+                    "metadata": {
+                        "weight": item.get("weight"),
+                        "is_uncertain": item.get("is_uncertain"),
+                        "status": item.get("status"),
+                        "emotion": item.get("emotion"),
+                        "start_date": item.get("start_date"),
+                        "end_date": item.get("end_date"),
+                    }
+                }
+                new_person_profiles[destination]["facts"].append(fact_record)
+        
+        logger.debug(f"New person profiles to add: {list(new_person_profiles.keys())}")
+        
+        # Build person resolution cache: for each person name, decide reuse/new/ambiguous
+        # Also pre-generate person_uid for new nodes to ensure consistency within the batch
+        person_decisions = {}
+        person_uid_cache = {}  # person_name -> UUID for new nodes
+        
+        for person_name, new_profile in new_person_profiles.items():
+            existing_profiles_for_name = existing_person_profiles.get(person_name, [])
+            decision = self._select_person_candidate(person_name, new_profile, existing_profiles_for_name)
+            person_decisions[person_name] = decision
+            
+            # Handle ambiguous and unconfirmed cases
+            # These require user interaction to resolve properly
+            if decision["decision"] == "ambiguous":
+                logger.error(f"Ambiguous person match for '{person_name}'. Multiple candidates found.")
+                raise AmbiguousPersonException(
+                    person_name=person_name,
+                    candidates=decision.get("candidates", []),
+                    new_profile=new_profile,
+                    message=f"Cannot disambiguate '{person_name}': {len(decision.get('candidates', []))} existing nodes match equally. Please specify which person you mean."
+                )
+            elif decision["decision"] == "unconfirmed":
+                logger.warning(f"Unconfirmed person match for '{person_name}'. No clear overlap with {decision['existing_count']} existing node(s).")
+                raise UnconfirmedPersonException(
+                    person_name=person_name,
+                    existing_count=decision['existing_count'],
+                    new_profile=new_profile,
+                    message=f"Is '{person_name}' a new person? {decision['existing_count']} existing node(s) found but no relationship overlap detected."
+                )
+            
+            # If decision is "new", generate and cache the person_uid now
+            # This ensures all relationships for the same new person use the same UUID
+            if decision["decision"] == "new":
+                person_uid_cache[person_name] = str(uuid.uuid4())
+                logger.debug(f"Pre-generated person_uid={person_uid_cache[person_name]} for new person '{person_name}'")
+            elif decision["decision"] == "reuse":
+                # Cache the existing person_uid for reused nodes too
+                person_uid_cache[person_name] = decision["person_uid"]
+        
+        logger.debug(f"Person decisions: {person_decisions}")
+        logger.debug(f"Person UID cache: {person_uid_cache}")
+        
+        # Now that person_uid_cache is complete, propagate UIDs into fact records
+        # This allows more precise matching when both source and target are persons in this batch
+        for person_name, profile in new_person_profiles.items():
+            for fact in profile["facts"]:
+                target_name = fact["target_name"]
+                # If target is a person and we have a UID for them, fill it in
+                if fact["target_type"] == "person" and target_name in person_uid_cache:
+                    fact["target_uid"] = person_uid_cache[target_name]
+                    logger.debug(f"Propagated target_uid for {person_name} -> {target_name}: {fact['target_uid']}")
+        
         for i, item in enumerate(to_be_added):
             # entities
             source = item["source"]
@@ -730,13 +945,46 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             last_mentioned = item.get("last_mentioned")
             usage_count = item.get("usage_count")
 
-            # search for the nodes with the closest embeddings
-            source_node_search_result = self._search_source_node(
-                source_embedding, user_id, threshold=0.9
-            )
-            destination_node_search_result = self._search_destination_node(
-                dest_embedding, user_id, threshold=0.9
-            )
+            # For person nodes, use the decision from person_decisions instead of embedding search
+            # This enables proper person disambiguation
+            source_node_search_result = None
+            destination_node_search_result = None
+            source_person_uid_to_use = None
+            dest_person_uid_to_use = None
+            
+            if source_type == "person" and source in person_decisions:
+                decision = person_decisions[source]
+                if decision["decision"] == "reuse":
+                    # Create a result structure that matches what _search_source_node returns
+                    source_node_search_result = [{"elementId(source_candidate)": decision["element_id"]}]
+                    source_person_uid_to_use = decision["person_uid"]
+                    logger.debug(f"Reusing existing person node for source '{source}' with person_uid={source_person_uid_to_use}")
+                elif decision["decision"] == "new":
+                    # Use the cached person_uid to ensure consistency across all relationships in this batch
+                    source_person_uid_to_use = person_uid_cache.get(source)
+                    logger.debug(f"Creating new person node for source '{source}' with cached person_uid={source_person_uid_to_use}")
+                    # source_node_search_result remains None to trigger the "new node" branch
+            else:
+                # Not a person or not in decisions - use embedding search as before
+                source_node_search_result = self._search_source_node(
+                    source_embedding, user_id, threshold=0.9
+                )
+            
+            if destination_type == "person" and destination in person_decisions:
+                decision = person_decisions[destination]
+                if decision["decision"] == "reuse":
+                    destination_node_search_result = [{"elementId(destination_candidate)": decision["element_id"]}]
+                    dest_person_uid_to_use = decision["person_uid"]
+                    logger.debug(f"Reusing existing person node for destination '{destination}' with person_uid={dest_person_uid_to_use}")
+                elif decision["decision"] == "new":
+                    # Use the cached person_uid
+                    dest_person_uid_to_use = person_uid_cache.get(destination)
+                    logger.debug(f"Creating new person node for destination '{destination}' with cached person_uid={dest_person_uid_to_use}")
+            else:
+                # Not a person or not in decisions - use embedding search
+                destination_node_search_result = self._search_destination_node(
+                    dest_embedding, user_id, threshold=0.9
+                )
 
             logger.debug(f"Processing item: {item}. Source found: {bool(source_node_search_result)}. Destination found: {bool(destination_node_search_result)}")
 
@@ -767,39 +1015,77 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
-                # MERGE on {name, user_id} ensures role nodes are reused for this user
-                # E.g., "roommate" for Alex and Jordan will find the same role node
-                cypher = f"""
-                    MATCH (source)
-                    WHERE elementId(source) = $source_id
-                    MERGE (destination:{destination_type} {{name: $destination_name, user_id: $user_id}})
-                    ON CREATE SET
-                        destination.created_at = $current_formatted_time,
-                        destination.embedding = $destination_embedding
-                    ON MATCH SET
-                        destination.embedding = $destination_embedding
-                    MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
-                        r.created_at = $current_formatted_time,
-                        r.usage_count = 1,
-                        r.last_mentioned = $current_formatted_time{additional_set_properties_str}
-                    ON MATCH SET
-                        r.last_mentioned = $current_formatted_time,
-                        r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
-                    RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                    """
+                # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
+                # For other nodes or existing persons, use standard MERGE on (name, user_id)
+                
+                if destination_type == "person" and dest_person_uid_to_use and destination_node_search_result is None:
+                    # New person node - MERGE on (name, user_id, person_uid) to ensure uniqueness
+                    cypher = f"""
+                        MATCH (source)
+                        WHERE elementId(source) = $source_id
+                        MERGE (destination:{destination_type} {{name: $destination_name, user_id: $user_id, person_uid: $dest_person_uid}})
+                        ON CREATE SET
+                            destination.created_at = $current_formatted_time,
+                            destination.embedding = $destination_embedding
+                        ON MATCH SET
+                            destination.embedding = $destination_embedding
+                        MERGE (source)-[r:{relationship}]->(destination)
+                        ON CREATE SET 
+                            r.created_at = $current_formatted_time,
+                            r.usage_count = 1,
+                            r.last_mentioned = $current_formatted_time{additional_set_properties_str}
+                        ON MATCH SET
+                            r.last_mentioned = $current_formatted_time,
+                            r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
+                        RETURN source.name AS source, type(r) AS relationship, destination.name AS target
+                        """
+                    
+                    params = {
+                        "source_id": source_node_search_result[0]["elementId(source_candidate)"],
+                        "destination_name": destination,
+                        "relationship": relationship,
+                        "destination_type": destination_type,
+                        "destination_embedding": dest_embedding,
+                        "user_id": user_id,
+                        "current_formatted_time": current_formatted_time,
+                        "dest_person_uid": dest_person_uid_to_use
+                    }
+                else:
+                    # Non-person or existing person - standard MERGE on (name, user_id)
+                    on_create_clauses = [
+                        "destination.created_at = $current_formatted_time",
+                        "destination.embedding = $destination_embedding"
+                    ]
+                    # Note: person_uid not in MERGE pattern, so don't set it here
+                    
+                    cypher = f"""
+                        MATCH (source)
+                        WHERE elementId(source) = $source_id
+                        MERGE (destination:{destination_type} {{name: $destination_name, user_id: $user_id}})
+                        ON CREATE SET
+                            {", ".join(on_create_clauses)}
+                        ON MATCH SET
+                            destination.embedding = $destination_embedding
+                        MERGE (source)-[r:{relationship}]->(destination)
+                        ON CREATE SET 
+                            r.created_at = $current_formatted_time,
+                            r.usage_count = 1,
+                            r.last_mentioned = $current_formatted_time{additional_set_properties_str}
+                        ON MATCH SET
+                            r.last_mentioned = $current_formatted_time,
+                            r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
+                        RETURN source.name AS source, type(r) AS relationship, destination.name AS target
+                        """
 
-                params = {
-                    "source_id": source_node_search_result[0][
-                        "elementId(source_candidate)"
-                    ],
-                    "destination_name": destination,
-                    "relationship": relationship,
-                    "destination_type": destination_type,
-                    "destination_embedding": dest_embedding,
-                    "user_id": user_id,
-                    "current_formatted_time": current_formatted_time,
-                }
+                    params = {
+                        "source_id": source_node_search_result[0]["elementId(source_candidate)"],
+                        "destination_name": destination,
+                        "relationship": relationship,
+                        "destination_type": destination_type,
+                        "destination_embedding": dest_embedding,
+                        "user_id": user_id,
+                        "current_formatted_time": current_formatted_time,
+                    }
 
                 # Add additional parameters to params if they exist
                 if weight is not None:
@@ -850,38 +1136,76 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
-                # MERGE on {name, user_id} ensures role nodes are reused for this user
-                cypher = f"""
-                    MATCH (destination)
-                    WHERE elementId(destination) = $destination_id
-                    MERGE (source:{source_type} {{name: $source_name, user_id: $user_id}})
-                    ON CREATE SET
-                        source.created_at = $current_formatted_time,
-                        source.embedding = $source_embedding
-                    ON MATCH SET
-                        source.embedding = $source_embedding
-                    MERGE (source)-[r:{relationship}]->(destination)
-                    ON CREATE SET 
-                        r.created_at = $current_formatted_time,
-                        r.usage_count = 1,
-                        r.last_mentioned = $current_formatted_time{additional_set_properties_str}
-                    ON MATCH SET
-                        r.last_mentioned = $current_formatted_time,
-                        r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
-                    RETURN source.name AS source, type(r) AS relationship, destination.name AS target
-                    """
+                # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
+                # For other nodes or existing persons, use standard MERGE on (name, user_id)
+                
+                if source_type == "person" and source_person_uid_to_use and source_node_search_result is None:
+                    # New person node - MERGE on (name, user_id, person_uid) to ensure uniqueness
+                    cypher = f"""
+                        MATCH (destination)
+                        WHERE elementId(destination) = $destination_id
+                        MERGE (source:{source_type} {{name: $source_name, user_id: $user_id, person_uid: $source_person_uid}})
+                        ON CREATE SET
+                            source.created_at = $current_formatted_time,
+                            source.embedding = $source_embedding
+                        ON MATCH SET
+                            source.embedding = $source_embedding
+                        MERGE (source)-[r:{relationship}]->(destination)
+                        ON CREATE SET 
+                            r.created_at = $current_formatted_time,
+                            r.usage_count = 1,
+                            r.last_mentioned = $current_formatted_time{additional_set_properties_str}
+                        ON MATCH SET
+                            r.last_mentioned = $current_formatted_time,
+                            r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
+                        RETURN source.name AS source, type(r) AS relationship, destination.name AS target
+                        """
 
-                params = {
-                    "destination_id": destination_node_search_result[0][
-                        "elementId(destination_candidate)"
-                    ],
-                    "source_name": source,
-                    "relationship": relationship,
-                    "source_type": source_type,
-                    "source_embedding": source_embedding,
-                    "user_id": user_id,
-                    "current_formatted_time": current_formatted_time,
-                }
+                    params = {
+                        "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
+                        "source_name": source,
+                        "relationship": relationship,
+                        "source_type": source_type,
+                        "source_embedding": source_embedding,
+                        "user_id": user_id,
+                        "current_formatted_time": current_formatted_time,
+                        "source_person_uid": source_person_uid_to_use
+                    }
+                else:
+                    # Non-person or existing person - standard MERGE on (name, user_id)
+                    on_create_clauses = [
+                        "source.created_at = $current_formatted_time",
+                        "source.embedding = $source_embedding"
+                    ]
+                    
+                    cypher = f"""
+                        MATCH (destination)
+                        WHERE elementId(destination) = $destination_id
+                        MERGE (source:{source_type} {{name: $source_name, user_id: $user_id}})
+                        ON CREATE SET
+                            {", ".join(on_create_clauses)}
+                        ON MATCH SET
+                            source.embedding = $source_embedding
+                        MERGE (source)-[r:{relationship}]->(destination)
+                        ON CREATE SET 
+                            r.created_at = $current_formatted_time,
+                            r.usage_count = 1,
+                            r.last_mentioned = $current_formatted_time{additional_set_properties_str}
+                        ON MATCH SET
+                            r.last_mentioned = $current_formatted_time,
+                            r.usage_count = COALESCE(r.usage_count, 0) + 1{additional_set_properties_str}
+                        RETURN source.name AS source, type(r) AS relationship, destination.name AS target
+                        """
+
+                    params = {
+                        "destination_id": destination_node_search_result[0]["elementId(destination_candidate)"],
+                        "source_name": source,
+                        "relationship": relationship,
+                        "source_type": source_type,
+                        "source_embedding": source_embedding,
+                        "user_id": user_id,
+                        "current_formatted_time": current_formatted_time,
+                    }
 
                 # Add additional parameters to params if they exist
                 if weight is not None:
@@ -1014,19 +1338,34 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 if relationship_set_clauses:
                     additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
 
-                # MERGE on {name, user_id} ensures role nodes are reused for this user
-                # Both source and destination can be role nodes that may already exist
+                # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
+                # For other nodes, use standard MERGE on (name, user_id)
+                
+                # Determine MERGE patterns for source
+                if source_type == "person" and source_person_uid_to_use:
+                    source_merge_pattern = f"{{name: $source_name, user_id: $user_id, person_uid: $source_person_uid}}"
+                    source_on_create = ["n.created_at = $current_formatted_time", "n.embedding = $source_embedding"]
+                else:
+                    source_merge_pattern = f"{{name: $source_name, user_id: $user_id}}"
+                    source_on_create = ["n.created_at = $current_formatted_time", "n.embedding = $source_embedding"]
+                
+                # Determine MERGE patterns for destination
+                if destination_type == "person" and dest_person_uid_to_use:
+                    dest_merge_pattern = f"{{name: $dest_name, user_id: $user_id, person_uid: $dest_person_uid}}"
+                    dest_on_create = ["m.created_at = $current_formatted_time", "m.embedding = $dest_embedding"]
+                else:
+                    dest_merge_pattern = f"{{name: $dest_name, user_id: $user_id}}"
+                    dest_on_create = ["m.created_at = $current_formatted_time", "m.embedding = $dest_embedding"]
+                
                 cypher = f"""
-                    MERGE (n:{source_type} {{name: $source_name, user_id: $user_id}})
+                    MERGE (n:{source_type} {source_merge_pattern})
                     ON CREATE SET 
-                        n.created_at = $current_formatted_time, 
-                        n.embedding = $source_embedding
+                        {", ".join(source_on_create)}
                     ON MATCH SET 
                         n.embedding = $source_embedding
-                    MERGE (m:{destination_type} {{name: $dest_name, user_id: $user_id}})
+                    MERGE (m:{destination_type} {dest_merge_pattern})
                     ON CREATE SET 
-                        m.created_at = $current_formatted_time, 
-                        m.embedding = $dest_embedding
+                        {", ".join(dest_on_create)}
                     ON MATCH SET 
                         m.embedding = $dest_embedding
                     MERGE (n)-[rel:{relationship}]->(m)
@@ -1049,6 +1388,11 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     "user_id": user_id,
                     "current_formatted_time": current_formatted_time,
                 }
+                
+                if source_type == "person" and source_person_uid_to_use:
+                    params["source_person_uid"] = source_person_uid_to_use
+                if destination_type == "person" and dest_person_uid_to_use:
+                    params["dest_person_uid"] = dest_person_uid_to_use
 
                 # Add additional parameters to params if they exist
                 if weight is not None:
@@ -1521,6 +1865,445 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         MATCH (n) DETACH DELETE n
         """
         return self.graph.query(cypher_query)
+    
+    def _build_person_profiles(self, search_output, entity_type_map):
+        """
+        Build profiles for each person node found in the search output.
+        
+        FLATTENED STRUCTURE: All relationships are stored as normalized fact records
+        in a single list, making comparison more robust and preventing information loss.
+        
+        Args:
+            search_output: List of dictionaries from _search_graph_db, each containing:
+                - source, source_id, source_labels, source_person_uid
+                - destination, destination_id, destination_labels, destination_person_uid
+                - relatationship, relation_id, weight, status, etc.
+            entity_type_map: Dict mapping entity names to their types from extraction
+                
+        Returns:
+            Dict keyed by normalized person name -> list of profile dicts.
+            Each profile dict contains:
+                - person_uid: str or None
+                - element_id: Neo4j element ID
+                - name: normalized name
+                - facts: list of normalized fact records, each containing:
+                    * direction: "out" or "in"
+                    * relationship: relationship type
+                    * target_name: normalized name of the other node
+                    * target_uid: person_uid if target is a person, else None
+                    * target_type: inferred type (from labels or entity_type_map)
+                    * metadata: dict with weight, status, emotion, etc. (excludes volatile timestamps)
+        """
+        profiles = {}
+        
+        if not search_output:
+            return profiles
+        
+        for row in search_output:
+            # Process source if it's a person
+            source_name = row.get("source")
+            source_labels = row.get("source_labels", [])
+            source_type = entity_type_map.get(source_name, "unknown")
+            
+            # Check if source is a person (either from labels or entity_type_map)
+            is_source_person = (
+                source_type == "person" or
+                "person" in [label.lower() for label in source_labels] if source_labels else False
+            )
+            
+            if is_source_person and source_name:
+                if source_name not in profiles:
+                    profiles[source_name] = []
+                
+                # Find or create profile for this specific node instance
+                source_id = row.get("source_id")
+                source_person_uid = row.get("source_person_uid")
+                
+                # Check if we already have a profile for this specific node (by element_id)
+                existing_profile = None
+                for prof in profiles[source_name]:
+                    if prof["element_id"] == source_id:
+                        existing_profile = prof
+                        break
+                
+                if not existing_profile:
+                    existing_profile = {
+                        "person_uid": source_person_uid,
+                        "element_id": source_id,
+                        "name": source_name,
+                        "facts": []  # Flattened list of fact records
+                    }
+                    profiles[source_name].append(existing_profile)
+                
+                # Build outgoing fact record
+                dest_name = row.get("destination")
+                dest_labels = row.get("destination_labels", [])
+                dest_person_uid = row.get("destination_person_uid")
+                dest_type = entity_type_map.get(dest_name, "unknown")
+                
+                # Infer target type from labels if available
+                if dest_labels:
+                    # Use the first label that's not a generic one
+                    for label in dest_labels:
+                        label_lower = label.lower()
+                        if label_lower in ["person", "role", "organization", "location", "concept", "activity"]:
+                            dest_type = label_lower
+                            break
+                
+                fact_record = {
+                    "direction": "out",
+                    "relationship": row.get("relatationship"),
+                    "target_name": dest_name,
+                    "target_uid": dest_person_uid,  # Will be None for non-person nodes
+                    "target_type": dest_type,
+                    "metadata": {
+                        "weight": row.get("weight"),
+                        "is_uncertain": row.get("is_uncertain"),
+                        "status": row.get("status"),
+                        "emotion": row.get("emotion"),
+                        # Exclude volatile timestamps: last_mentioned, usage_count
+                        # Include dates that represent relationship timing:
+                        "start_date": row.get("start_date"),
+                        "end_date": row.get("end_date"),
+                    }
+                }
+                existing_profile["facts"].append(fact_record)
+            
+            # Process destination if it's a person
+            dest_name = row.get("destination")
+            dest_labels = row.get("destination_labels", [])
+            dest_type = entity_type_map.get(dest_name, "unknown")
+            
+            is_dest_person = (
+                dest_type == "person" or
+                "person" in [label.lower() for label in dest_labels] if dest_labels else False
+            )
+            
+            if is_dest_person and dest_name:
+                if dest_name not in profiles:
+                    profiles[dest_name] = []
+                
+                dest_id = row.get("destination_id")
+                dest_person_uid = row.get("destination_person_uid")
+                
+                # Find or create profile
+                existing_profile = None
+                for prof in profiles[dest_name]:
+                    if prof["element_id"] == dest_id:
+                        existing_profile = prof
+                        break
+                
+                if not existing_profile:
+                    existing_profile = {
+                        "person_uid": dest_person_uid,
+                        "element_id": dest_id,
+                        "name": dest_name,
+                        "facts": []
+                    }
+                    profiles[dest_name].append(existing_profile)
+                
+                # Build incoming fact record
+                source_name_for_incoming = row.get("source")
+                source_labels_for_incoming = row.get("source_labels", [])
+                source_person_uid_for_incoming = row.get("source_person_uid")
+                source_type_for_incoming = entity_type_map.get(source_name_for_incoming, "unknown")
+                
+                # Infer source type from labels
+                if source_labels_for_incoming:
+                    for label in source_labels_for_incoming:
+                        label_lower = label.lower()
+                        if label_lower in ["person", "role", "organization", "location", "concept", "activity"]:
+                            source_type_for_incoming = label_lower
+                            break
+                
+                fact_record = {
+                    "direction": "in",
+                    "relationship": row.get("relatationship"),
+                    "target_name": source_name_for_incoming,
+                    "target_uid": source_person_uid_for_incoming,
+                    "target_type": source_type_for_incoming,
+                    "metadata": {
+                        "weight": row.get("weight"),
+                        "is_uncertain": row.get("is_uncertain"),
+                        "status": row.get("status"),
+                        "emotion": row.get("emotion"),
+                        "start_date": row.get("start_date"),
+                        "end_date": row.get("end_date"),
+                    }
+                }
+                existing_profile["facts"].append(fact_record)
+        
+        logger.debug(f"Built person profiles: {profiles}")
+        return profiles
+    
+    def _compare_person_profiles(self, existing_profile, new_profile):
+        """
+        Compare an existing person profile with a new one using signature-based matching.
+        
+        SIGNATURE-BASED MATCHING: Facts are compared using (direction, relationship, target_name) 
+        as the primary signature, optionally enhanced with target_uid for person nodes.
+        
+        Args:
+            existing_profile: Dict with person_uid, element_id, name, and facts list
+            new_profile: Dict with the same structure (but person_uid will be None)
+                
+        Returns:
+            str: One of "match", "contradict", or "no_overlap"
+                - "match": Strong evidence they're the same person
+                - "contradict": Evidence they're different people
+                - "no_overlap": Not enough information to determine
+        """
+        existing_facts = existing_profile["facts"]
+        new_facts = new_profile["facts"]
+        
+        # Build comparable signatures for existing facts
+        # Signature = (direction, relationship, target_name, target_uid if present)
+        # Only include target_uid in signature if it's actually populated
+        # This allows exact name matches to work when UIDs aren't available
+        existing_signatures = set()
+        for fact in existing_facts:
+            # Create signature tuple, excluding volatile fields
+            target_uid = fact.get("target_uid")
+            if target_uid:
+                sig = (
+                    fact["direction"],
+                    fact["relationship"],
+                    fact["target_name"],
+                    target_uid
+                )
+            else:
+                # No UID available, use 3-tuple signature (name-based matching)
+                sig = (
+                    fact["direction"],
+                    fact["relationship"],
+                    fact["target_name"]
+                )
+            existing_signatures.add(sig)
+        
+        # Build comparable signatures for new facts
+        new_signatures = set()
+        for fact in new_facts:
+            target_uid = fact.get("target_uid")
+            if target_uid:
+                sig = (
+                    fact["direction"],
+                    fact["relationship"],
+                    fact["target_name"],
+                    target_uid
+                )
+            else:
+                sig = (
+                    fact["direction"],
+                    fact["relationship"],
+                    fact["target_name"]
+                )
+            new_signatures.add(sig)
+        
+        # Calculate exact matches on signatures
+        exact_matches = existing_signatures.intersection(new_signatures)
+        
+        # Score for matching evidence
+        match_score = 0
+        contradict_score = 0
+        
+        # Exact signature matches are the primary signal
+        if exact_matches:
+            match_count = len(exact_matches)
+            if match_count >= 3:
+                match_score += 15  # Multiple exact matches = very strong signal
+            elif match_count == 2:
+                match_score += 10  # Two matches = strong signal
+            else:
+                match_score += 6   # One match = medium signal
+            logger.debug(f"Exact signature matches ({match_count}): {exact_matches}")
+        
+        # Check for contradictions: same relationship type but different target
+        # This indicates mutually exclusive facts
+        existing_rel_map = {}  # (direction, relationship) -> set of target_names
+        for fact in existing_facts:
+            key = (fact["direction"], fact["relationship"])
+            if key not in existing_rel_map:
+                existing_rel_map[key] = set()
+            existing_rel_map[key].add((fact["target_name"], fact.get("target_uid")))
+        
+        new_rel_map = {}
+        for fact in new_facts:
+            key = (fact["direction"], fact["relationship"])
+            if key not in new_rel_map:
+                new_rel_map[key] = set()
+            new_rel_map[key].add((fact["target_name"], fact.get("target_uid")))
+        
+        # Define single-valued outward relationships that are typically exclusive
+        # These are relationships where a person usually has only one target at a time
+        EXCLUSIVE_OUT_RELATIONSHIPS = {
+            "works_at", "employed_by", "lives_in", "resides_in", "works_in",
+            "attends", "studies_at", "enrolled_in", "married_to", "spouse_of",
+            "reports_to", "manages", "ceo_of", "founder_of", "owns_company"
+        }
+        
+        # Look for contradictory facts
+        for rel_key in new_rel_map:
+            if rel_key in existing_rel_map:
+                existing_targets = existing_rel_map[rel_key]
+                new_targets = new_rel_map[rel_key]
+                
+                # If they have no overlap, it might be a contradiction
+                if not existing_targets.intersection(new_targets):
+                    direction, relationship = rel_key
+                    
+                    # Check for contradictions based on relationship type and direction
+                    
+                    # 1. Role anchor "is" relationships are strongly exclusive
+                    if relationship == "is" and direction == "in":
+                        # Different role->is->person chains suggest different people
+                        contradict_score += 8
+                        logger.debug(f"Contradiction: Different 'is' targets for same role: existing={existing_targets}, new={new_targets}")
+                    
+                    # 2. Different person_uids for same relationship = different people
+                    elif any(uid1 and uid2 and uid1 != uid2 
+                           for (name1, uid1) in existing_targets 
+                           for (name2, uid2) in new_targets):
+                        # Same relationship points to different person_uids
+                        contradict_score += 5
+                        logger.debug(f"Contradiction: Same relationship points to different person UIDs")
+                    
+                    # 3. Single-valued outward relationships to non-person nodes
+                    # (e.g., works_at, lives_in) are typically exclusive
+                    elif direction == "out" and relationship in EXCLUSIVE_OUT_RELATIONSHIPS:
+                        # Check if targets are non-person nodes (no UIDs)
+                        # If all targets lack UIDs, they're likely non-person nodes (jobs, locations, etc.)
+                        all_existing_no_uid = all(uid is None for (name, uid) in existing_targets)
+                        all_new_no_uid = all(uid is None for (name, uid) in new_targets)
+                        
+                        if all_existing_no_uid and all_new_no_uid:
+                            # Different non-person targets for exclusive relationship = contradiction
+                            contradict_score += 6
+                            logger.debug(f"Contradiction: Different exclusive '{relationship}' targets: existing={existing_targets}, new={new_targets}")
+        
+        # Decision logic
+        logger.debug(f"Profile comparison scores - match: {match_score}, contradict: {contradict_score}")
+        
+        # If we have strong contradictory evidence, return contradict
+        if contradict_score >= 5:
+            return "contradict"
+        
+        # If we have strong matching evidence, return match
+        if match_score >= 8:
+            return "match"
+        
+        # If we have some matching evidence but not strong, still consider it a match
+        if match_score >= 3 and contradict_score == 0:
+            return "match"
+        
+        # Otherwise, not enough overlap to determine
+        return "no_overlap"
+    
+    def _select_person_candidate(self, person_name, new_profile, existing_profiles):
+        """
+        Select which existing person node (if any) to reuse for a new mention.
+        
+        Args:
+            person_name: str, the normalized name of the person
+            new_profile: Dict with the new person's relationship profile
+            existing_profiles: List of existing profile dicts for this name
+                
+        Returns:
+            Dict with keys:
+                - decision: str, one of "reuse", "new", "ambiguous", "unconfirmed"
+                - element_id: str or None, the Neo4j element ID to reuse (if decision="reuse")
+                - person_uid: str or None, the person_uid to reuse (if decision="reuse")
+                - matched_profile: dict or None, the full profile that matched
+                - all_comparisons: list of tuples (profile, comparison_result) for debugging
+        """
+        if not existing_profiles:
+            return {
+                "decision": "new",
+                "element_id": None,
+                "person_uid": None,
+                "matched_profile": None,
+                "all_comparisons": []
+            }
+        
+        # Compare new profile against each existing profile
+        comparisons = []
+        matches = []
+        contradictions = []
+        no_overlaps = []
+        
+        for existing_profile in existing_profiles:
+            result = self._compare_person_profiles(existing_profile, new_profile)
+            comparisons.append((existing_profile, result))
+            
+            if result == "match":
+                matches.append(existing_profile)
+            elif result == "contradict":
+                contradictions.append(existing_profile)
+            else:  # no_overlap
+                no_overlaps.append(existing_profile)
+        
+        logger.debug(f"Person candidate selection for '{person_name}': {len(matches)} matches, {len(contradictions)} contradictions, {len(no_overlaps)} no overlaps")
+        
+        # Decision logic
+        if len(matches) == 1:
+            # Clear single match - reuse this node
+            matched = matches[0]
+            return {
+                "decision": "reuse",
+                "element_id": matched["element_id"],
+                "person_uid": matched["person_uid"],
+                "matched_profile": matched,
+                "all_comparisons": comparisons
+            }
+        
+        elif len(matches) > 1:
+            # Multiple matches - ambiguous
+            # This shouldn't happen often, but could if two existing nodes have very similar profiles
+            logger.warning(f"Ambiguous person match for '{person_name}': {len(matches)} existing nodes matched")
+            return {
+                "decision": "ambiguous",
+                "element_id": None,
+                "person_uid": None,
+                "matched_profile": None,
+                "all_comparisons": comparisons,
+                "candidates": matches
+            }
+        
+        elif len(contradictions) > 0 and len(no_overlaps) > 0:
+            # Some contradictions, some no overlaps - suggests there might be multiple people
+            # but we're not sure which (if any) the new one corresponds to
+            logger.info(f"Mixed signals for '{person_name}': {len(contradictions)} contradictions, {len(no_overlaps)} unclear")
+            return {
+                "decision": "ambiguous",
+                "element_id": None,
+                "person_uid": None,
+                "matched_profile": None,
+                "all_comparisons": comparisons,
+                "candidates": existing_profiles
+            }
+        
+        elif len(contradictions) > 0:
+            # All existing profiles contradict - likely a new person
+            logger.info(f"All existing profiles for '{person_name}' contradict new data - creating new node")
+            return {
+                "decision": "new",
+                "element_id": None,
+                "person_uid": None,
+                "matched_profile": None,
+                "all_comparisons": comparisons
+            }
+        
+        else:
+            # Only no_overlaps - not enough information
+            # Be conservative: ask for confirmation before creating a new node
+            logger.info(f"No overlap with existing profiles for '{person_name}' - unconfirmed")
+            return {
+                "decision": "unconfirmed",
+                "element_id": None,
+                "person_uid": None,
+                "matched_profile": None,
+                "all_comparisons": comparisons,
+                "existing_count": len(existing_profiles)
+            }
     
     def close(self):
         """Clean up resources including thread pool executor."""
