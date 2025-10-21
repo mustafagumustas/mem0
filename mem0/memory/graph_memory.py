@@ -549,9 +549,21 @@ Contextual Labeling Rules:
 - Let the entity's role in context guide the label: tangible things → object/product/vehicle; venues or physical settings → location/place; services or shops that users visit → location; actions or hobbies → activity; scheduled occurrences → event; dates, durations, or time expressions → time; abstract ideas or categories → concept.
 - Prefer the label that best captures how the entity is being discussed in this specific input, rather than relying only on its literal wording.
 
-Role Entity Rules:
-- When a relational title is extracted (roommate, best_friend, coach, manager, teammate, barista, childhood_friend, colleague, neighbor, mentor, advisor, etc.), emit it as an entity with entity_type set to 'role'.
-- Normalize to the base role label: lowercase with underscores for spaces (e.g., "Best Friend" → "best_friend", "Team Coach" → "team_coach").
+- Role Entity Rules:
+  - Whenever a relational title is mentioned (roommate, best_friend, coach, manager, teammate, barista, childhood_friend, colleague, neighbor, mentor, advisor, etc.), emit a dedicated entity with entity_type='role'.
+  - This applies even if the role appears inside a compound subject (e.g., "my best friend Sibel and I…", "my coach Jordan and our team…"). Always create the reusable role entity in addition to the named person.
+  - Normalize to the base role label: lowercase with underscores for spaces (e.g., "Best Friend" → "best_friend", "Team Coach" → "team_coach").
+  - If the phrasing is "<person> is my <role>" (or "is our/their <role>"), treat it exactly the same: produce the role entity and the person entity.
+  - Role detection checklist (apply every time a match is found):
+    * Possessive phrases: "my/our/their <role> <name>", "<role> of mine/ours"
+    * Reverse phrasing: "<name> is my/our/their <role>"
+    * Appositives: "<name>, my/our/their <role>, …"
+    * Coordinated subjects: "my/our/their <role> <name> and I …"
+    If any of these patterns (or obvious variations) are present, you MUST emit both the role entity and the named person as separate entities.
+  - Examples:
+    * "My best friend Sibel and I tried a new class" → entities: {filters['user_id']} (person), best_friend (role), sibel (person), new_class (activity).
+    * "Alex is my roommate" → entities: {filters['user_id']} (person), roommate (role), alex (person).
+  - When you detect a role, prepare the graph for the two-hop structure (Owner → has → Role and Role → is → Person). Do NOT plan or output a direct relationship such as "owner → roommate → person"; that pattern is invalid given our schema.
 - Do NOT attach temporal modifiers to role names. Strip them completely (e.g., "childhood friend" → extract "childhood" as separate time entity and "friend" as role entity; "former manager" → extract "former" as status/time indicator and "manager" as role entity).
 - Role entities represent reusable anchors that may connect to multiple people. A functionally identical role mention (e.g., multiple roommate references) should resolve to the SAME role node name.
 - Consistency is critical: if the user mentions "my roommate Alex" and later "my roommate Jordan", both should reference the entity "roommate" (not "roommate_alex" or "roommate_jordan").
@@ -874,30 +886,67 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         # Also pre-generate person_uid for new nodes to ensure consistency within the batch
         person_decisions = {}
         person_uid_cache = {}  # person_name -> UUID for new nodes
+        user_id_normalized = None
+        if user_id:
+            user_id_normalized = user_id.lower().replace(" ", "_")
         
         for person_name, new_profile in new_person_profiles.items():
             existing_profiles_for_name = existing_person_profiles.get(person_name, [])
-            decision = self._select_person_candidate(person_name, new_profile, existing_profiles_for_name)
+            skip_disambiguation_for_user = (
+                user_id_normalized is not None and person_name == user_id_normalized
+            )
+            
+            if skip_disambiguation_for_user:
+                if existing_profiles_for_name:
+                    primary_profile = existing_profiles_for_name[0]
+                    decision = {
+                        "decision": "reuse",
+                        "element_id": primary_profile.get("element_id"),
+                        "person_uid": primary_profile.get("person_uid"),
+                        "matched_profile": primary_profile,
+                        "all_comparisons": [],
+                    }
+                    logger.debug(
+                        "Skipping disambiguation for user '%s' and reusing existing profile with person_uid=%s",
+                        person_name,
+                        primary_profile.get("person_uid"),
+                    )
+                else:
+                    decision = {
+                        "decision": "new",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": [],
+                    }
+                    logger.debug(
+                        "Skipping disambiguation for user '%s' and creating a new profile",
+                        person_name,
+                    )
+            else:
+                decision = self._select_person_candidate(person_name, new_profile, existing_profiles_for_name)
+            
             person_decisions[person_name] = decision
             
             # Handle ambiguous and unconfirmed cases
-            # These require user interaction to resolve properly
-            if decision["decision"] == "ambiguous":
-                logger.error(f"Ambiguous person match for '{person_name}'. Multiple candidates found.")
-                raise AmbiguousPersonException(
-                    person_name=person_name,
-                    candidates=decision.get("candidates", []),
-                    new_profile=new_profile,
-                    message=f"Cannot disambiguate '{person_name}': {len(decision.get('candidates', []))} existing nodes match equally. Please specify which person you mean."
-                )
-            elif decision["decision"] == "unconfirmed":
-                logger.warning(f"Unconfirmed person match for '{person_name}'. No clear overlap with {decision['existing_count']} existing node(s).")
-                raise UnconfirmedPersonException(
-                    person_name=person_name,
-                    existing_count=decision['existing_count'],
-                    new_profile=new_profile,
-                    message=f"Is '{person_name}' a new person? {decision['existing_count']} existing node(s) found but no relationship overlap detected."
-                )
+            # These require user interaction to resolve properly, except for the account owner
+            if not skip_disambiguation_for_user:
+                if decision["decision"] == "ambiguous":
+                    logger.error(f"Ambiguous person match for '{person_name}'. Multiple candidates found.")
+                    raise AmbiguousPersonException(
+                        person_name=person_name,
+                        candidates=decision.get("candidates", []),
+                        new_profile=new_profile,
+                        message=f"Cannot disambiguate '{person_name}': {len(decision.get('candidates', []))} existing nodes match equally. Please specify which person you mean."
+                    )
+                elif decision["decision"] == "unconfirmed":
+                    logger.warning(f"Unconfirmed person match for '{person_name}'. No clear overlap with {decision['existing_count']} existing node(s).")
+                    raise UnconfirmedPersonException(
+                        person_name=person_name,
+                        existing_count=decision['existing_count'],
+                        new_profile=new_profile,
+                        message=f"Is '{person_name}' a new person? {decision['existing_count']} existing node(s) found but no relationship overlap detected."
+                    )
             
             # If decision is "new", generate and cache the person_uid now
             # This ensures all relationships for the same new person use the same UUID
@@ -1428,7 +1477,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         3. Filter out any literal pronoun nodes that slipped through
         """
         # Pronouns that should never become nodes
-        PRONOUN_BLACKLIST = {'i', 'me', 'my', 'myself', 'he', 'she', 'they', 'him', 'her', 'them', 'his', 'hers', 'their', 'theirs'}
+        PRONOUN_BLACKLIST = {'me', 'my', 'myself', 'he', 'she', 'they', 'him', 'her', 'them', 'his', 'hers', 'their', 'theirs'}
         
         filtered_entities = []
         for item in entity_list:
@@ -2153,21 +2202,15 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     
                     # Check for contradictions based on relationship type and direction
                     
-                    # 1. Role anchor "is" relationships are strongly exclusive
-                    if relationship == "is" and direction == "in":
-                        # Different role->is->person chains suggest different people
-                        contradict_score += 8
-                        logger.debug(f"Contradiction: Different 'is' targets for same role: existing={existing_targets}, new={new_targets}")
-                    
-                    # 2. Different person_uids for same relationship = different people
-                    elif any(uid1 and uid2 and uid1 != uid2 
+                    # 1. Different person_uids for same relationship = different people
+                    if any(uid1 and uid2 and uid1 != uid2 
                            for (name1, uid1) in existing_targets 
                            for (name2, uid2) in new_targets):
                         # Same relationship points to different person_uids
                         contradict_score += 5
                         logger.debug(f"Contradiction: Same relationship points to different person UIDs")
                     
-                    # 3. Single-valued outward relationships to non-person nodes
+                    # 2. Single-valued outward relationships to non-person nodes
                     # (e.g., works_at, lives_in) are typically exclusive
                     elif direction == "out" and relationship in EXCLUSIVE_OUT_RELATIONSHIPS:
                         # Check if targets are non-person nodes (no UIDs)
@@ -2242,6 +2285,17 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 no_overlaps.append(existing_profile)
         
         logger.debug(f"Person candidate selection for '{person_name}': {len(matches)} matches, {len(contradictions)} contradictions, {len(no_overlaps)} no overlaps")
+        
+        # If there's exactly one existing profile and no contradictions, reuse it even without overlapping facts.
+        if len(existing_profiles) == 1 and not contradictions:
+            primary_profile = existing_profiles[0]
+            return {
+                "decision": "reuse",
+                "element_id": primary_profile["element_id"],
+                "person_uid": primary_profile["person_uid"],
+                "matched_profile": primary_profile if matches else None,
+                "all_comparisons": comparisons
+            }
         
         # Decision logic
         if len(matches) == 1:

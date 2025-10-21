@@ -157,15 +157,25 @@ Follow these key principles:
    - Any role entity MUST be linked in two hops:
      1. Owner → has → Role (e.g., USER_ID → has → roommate)
      2. Role → is → Person_Filling_Role (e.g., roommate → is → john)
+   - If the text states “<person> is my/our/their <role>”, you MUST still emit both edges above: convert the possessive claim into Owner → has → Role and Role → is → <person>, even when the owner is implied (e.g., “he is my roommate”).
+   - Role detection checklist (apply all that match):
+     * Possessive phrases: "my/our/their <role> <name>", "<role> of mine/ours"
+     * Reverse phrasing: "<name> is my/our/their <role>"
+     * Appositives: "<name>, my/our/their <role>, …"
+     * Coordinated subjects: "my/our/their <role> <name> and I …"
+     Whenever any of these patterns (or clear variations) appear, you MUST emit both Owner → has → Role and Role → is → Person before extracting the rest of the facts.
+   - Never output a direct relationship where the role name appears as the predicate between owner and person (e.g., `USER_ID → roommate → alex`). Such direct edges are invalid; always break them into the two-hop pattern described above.
+   - Apply this pattern even when the role phrase is embedded with other subjects (“My best friend Sibel and I…”, “Our mentor Jordan joined us…”, “My coworker Alex and I tried…”). Emit the two-hop structure before describing any shared actions.
    - The role node MUST carry the "Role" label in the labels field.
    - The owner and person retain their existing labels (typically "Person").
    
    REUSABILITY OF ROLE NODES:
    - When the same role label applies to multiple individuals, you MUST reuse the same role entity and add multiple is edges.
-   - Example: "my roommate Alex" and "my roommate Jordan" → create ONE "roommate" role node with TWO is edges:
-     * USER_ID → has → roommate
-     * roommate → is → alex
-     * roommate → is → jordan
+   - Examples:
+     * "my roommate Alex" and "my roommate Jordan" → create ONE "roommate" role node with TWO is edges.
+     * "my best friend Sibel and I tried a new class" → output USER_ID → has → best_friend and best_friend → is → sibel, then add the activity edges for both participants.
+     * "He is my mentor Jordan" or "Jordan is my mentor" → output USER_ID → has → mentor and mentor → is → jordan before any other relationships.
+   - Forbidden pattern: do NOT emit a single edge `owner → <role_name> → person`. Always decompose it into the two required edges above.
    - Do NOT create "roommate_alex" and "roommate_jordan" as separate role nodes. The role anchor is shared; only the person changes.
    - If temporal context differs (e.g., "former roommate" vs "current roommate"), extract temporal modifiers as separate entities (e.g., "former", "current") with their own relationships to the role, not as part of the role name.
    
@@ -642,6 +652,23 @@ Key points:
 - Two-hop pattern: USER_ID → has → role_node → is → person
 - Temporal modifiers separate: "childhood friend" splits into "friend" role + "childhood" time entity
 - If later you see "my roommate Jordan", reuse the existing "roommate" node and add: roommate → is → jordan
+
+Example G3 (Role Mention with Implicit Owner):
+Input:
+"Anil is planning to run a half marathon, because he is my roommate I’m running with him as an exercise."
+
+Expected Output (abbreviated):
+{
+  "facts": [
+    {"source": "anil", "relationship": "planning_to_run", "destination": "half_marathon", "labels": {"source": "Person", "destination": "Event"}, "weight": "important", "emotion": "excited"},
+    {"source": "USER_ID", "relationship": "running_with", "destination": "anil", "labels": {"source": "Person", "destination": "Person"}, "weight": "important", "emotion": "enthusiastic"},
+    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "labels": {"source": "Person", "destination": "Role"}, "weight": "relevant", "emotion": "neutral"},
+    {"source": "roommate", "relationship": "is", "destination": "anil", "labels": {"source": "Role", "destination": "Person"}, "weight": "relevant", "emotion": "neutral"}
+  ]
+}
+
+Explanation:
+- The possessive clause “he is my roommate” MUST always yield USER_ID → has → roommate and roommate → is → anil in addition to any shared-action edges.
 
 Example H (Entity Hygiene - Avoiding Composite Names):
 Input:
