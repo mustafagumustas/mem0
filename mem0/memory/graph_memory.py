@@ -744,6 +744,16 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         else:
             extracted_entities = []
 
+        for entity in extracted_entities:
+            owner_name = entity.get("owner_person_name")
+            if isinstance(owner_name, str):
+                owner_name = owner_name.strip()
+                entity["owner_person_name"] = owner_name if owner_name else None
+            elif owner_name is None:
+                entity["owner_person_name"] = None
+            else:
+                entity["owner_person_name"] = None
+
         extracted_entities = self._remove_spaces_from_entities(extracted_entities)
         
         logger.debug(f"Extracted entities: {extracted_entities}")
@@ -1075,7 +1085,41 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         user_id_normalized = None
         if user_id:
             user_id_normalized = user_id.lower().replace(" ", "_")
-        
+
+        def _resolve_owner_person_uid(
+            owner_name,
+            source_name,
+            destination_name,
+            source_type_name,
+            destination_type_name,
+            source_uid,
+            destination_uid,
+        ):
+            """
+            Determine the owner_person_uid for a relationship using only the supplied owner name.
+            """
+            if not owner_name:
+                return None
+            if (
+                owner_name == source_name
+                and source_type_name == "person"
+                and source_uid
+            ):
+                return source_uid
+            if (
+                owner_name == destination_name
+                and destination_type_name == "person"
+                and destination_uid
+            ):
+                return destination_uid
+            cached_uid = person_uid_cache.get(owner_name)
+            if cached_uid:
+                return cached_uid
+            lookup_uid = self._lookup_person_uid_by_name(owner_name, user_id)
+            if lookup_uid:
+                person_uid_cache[owner_name] = lookup_uid
+            return lookup_uid
+
         for person_name, new_profile in new_person_profiles.items():
             existing_profiles_for_name = existing_person_profiles.get(person_name, [])
             skip_disambiguation_for_user = (
@@ -1355,10 +1399,14 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             emotion = item.get("emotion")
             last_mentioned = item.get("last_mentioned")
             usage_count = item.get("usage_count")
+            owner_person_name = item.get("owner_person_name") or None
+            owner_person_label = owner_person_name
+            owner_person_uid = None
 
             def _build_relationship_properties(alias):
                 clauses = []
-                rel_params = {}
+                rel_params = {"owner_person_uid": owner_person_uid}
+                clauses.append(f"{alias}.owner_person_uid = $owner_person_uid")
                 if weight is not None:
                     clauses.append(f"{alias}.weight = $weight")
                     rel_params["weight"] = weight
@@ -1491,19 +1539,41 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 destination_best_candidate = destination_scoring.get("candidate")
                 dest_best_score = destination_scoring.get("score", 0.0)
                 dest_threshold = self._get_label_threshold(destination_type)
-                if destination_best_candidate and dest_best_score >= dest_threshold:
-                    destination_node_search_result = [
-                        {"elementId(destination_candidate)": destination_best_candidate["node_id"]}
-                    ]
-                else:
+            if destination_best_candidate and dest_best_score >= dest_threshold:
+                destination_node_search_result = [
+                    {"elementId(destination_candidate)": destination_best_candidate["node_id"]}
+                ]
+            else:
                     if destination_best_candidate and dest_best_score >= dest_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA:
                         logger.info(
                             "[candidate_rejected] entity=%s label=%s score=%.4f threshold=%.4f",
                             destination,
                             destination_type,
                             dest_best_score,
-                            dest_threshold,
-                        )
+                        dest_threshold,
+                    )
+
+            owner_person_uid = _resolve_owner_person_uid(
+                owner_person_name,
+                source,
+                destination,
+                source_type,
+                destination_type,
+                source_person_uid_to_use,
+                dest_person_uid_to_use,
+            )
+            if owner_person_name and owner_person_uid is None:
+                logger.debug(
+                    "Owner name '%s' supplied but no matching person_uid found for relationship %s -> %s -> %s",
+                    owner_person_name,
+                    source,
+                    relationship,
+                    destination,
+                )
+            if owner_person_uid:
+                item["owner_person_name"] = owner_person_uid
+            else:
+                item["owner_person_name"] = owner_person_label
 
             logger.debug(f"Processing item: {item}. Source found: {bool(source_node_search_result)}. Destination found: {bool(destination_node_search_result)}")
 
@@ -1778,6 +1848,33 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         
         logger.debug(f"Finished adding entities. Results: {results}")
         return results
+
+    def _lookup_person_uid_by_name(self, person_name, user_id):
+        """
+        Look up an existing person's UID by normalized name for ownership attribution.
+        """
+        if not person_name or not user_id:
+            return None
+
+        query = """
+        MATCH (p:person {name: $person_name, user_id: $user_id})
+        RETURN p.person_uid AS person_uid
+        LIMIT 1
+        """
+        params = {"person_name": person_name, "user_id": user_id}
+        try:
+            records = self.graph.query(query, params=params)
+        except Exception as exc:  # pragma: no cover - defensive logging
+            logger.exception(
+                "Failed to look up person_uid for owner '%s': %s",
+                person_name,
+                exc,
+            )
+            return None
+
+        if records:
+            return records[0].get("person_uid")
+        return None
 
     def _score_entity_candidates(self, entity_record, candidates, metadata=None):
         """
@@ -2107,6 +2204,16 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             item["source"] = item["source"].lower().replace(" ", "_")
             item["relationship"] = item["relationship"].lower().replace(" ", "_")
             item["destination"] = item["destination"].lower().replace(" ", "_")
+            owner_person_name = item.get("owner_person_name")
+            if isinstance(owner_person_name, str):
+                owner_person_name = owner_person_name.strip()
+                if owner_person_name:
+                    owner_person_name = owner_person_name.lower().replace(" ", "_")
+                else:
+                    owner_person_name = None
+            else:
+                owner_person_name = None
+            item["owner_person_name"] = owner_person_name
 
             # Filter out relationships with pronoun nodes
             if item["source"] in PRONOUN_BLACKLIST or item["destination"] in PRONOUN_BLACKLIST:

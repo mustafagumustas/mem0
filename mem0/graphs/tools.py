@@ -173,6 +173,10 @@ RELATIONS_TOOL = {
                                 "type": "string",
                                 "description": "The destination entity of the relationship.",
                             },
+                            "owner_person_name": {
+                                "type": ["string", "null"],
+                                "description": "normalized person name that owns this fact.",
+                            },
                             "weight": {
                                 "type": "string",
                                 "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
@@ -211,6 +215,7 @@ RELATIONS_TOOL = {
                             "source",
                             "relationship",
                             "destination",
+                            "owner_person_name",
                         ],
                         "additionalProperties": False,
                     },
@@ -435,6 +440,10 @@ RELATIONS_STRUCT_TOOL = {
                                 "type": "string",
                                 "description": "The destination entity of the relationship.",
                             },
+                            "owner_person_name": {
+                                "type": ["string", "null"],
+                                "description": "normalized person name that owns this fact.",
+                            },
                             "weight": {
                                 "type": "string",
                                 "enum": ["ignored", "peripheral", "transitional", "relevant", "ritualistic", "important", "core_identity", "infatuation", "devotion", "obsession", "repressed", "negative_core"],
@@ -473,6 +482,7 @@ RELATIONS_STRUCT_TOOL = {
                             "source_entity",
                             "relatationship",
                             "destination_entity",
+                            "owner_person_name",
                         ],
                         "additionalProperties": False,
                     },

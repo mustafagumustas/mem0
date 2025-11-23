@@ -182,6 +182,15 @@ Follow these key principles:
    - Do NOT create additional direct edges between owner and person (e.g., owner → roommate_of → person) unless the text explicitly expresses another relationship beyond the role.
    - This pattern applies to ALL relational designations: roommate, best_friend, coach, manager, teammate, barista, childhood_friend, colleague, neighbor, mentor, advisor, etc.
 
+4b. Ownership Attribution
+   - Every fact MUST include `"owner_person_name"`.
+   - Use the canonical identifier for the human performing or feeling the fact. If the owner already exists (USER_ID or a named person), reuse that exact normalized identifier (e.g., `"USER_ID"` for the user, `"anil"` for Anil). For brand-new humans without an existing node, emit their normalized lowercase snake_case name so the graph can store it directly.
+   - Proxy/source nodes that represent the user’s experience (job_experience_1, workout_session_2, etc.) should still inherit the real human owner. For example, all edges emitted from `job_experience_1` that describe the user’s work must set `"owner_person_name": "USER_ID"`.
+   - Never point to role nodes; when a role entity is the source, use the actual person filling that role (e.g., roommate → is → alex ⇒ `"owner_person_name": "alex"`). For `owner → has → role` edges, the owner is the person claiming the role (usually USER_ID).
+   - For multi-person actions, emit separate facts for each participant so every `"owner_person_name"` maps to exactly one human.
+   - Emit `null` only when there is no human owner at all (pure entity-to-entity facts such as `parkour -- part_of --> belgrad_forest`).
+   - Continue applying the mandatory two-hop role rule above and ensure EVERY entity name, relationship, and `"owner_person_name"` output is lowercase snake_case.
+
 5. Uncertainty
    - If the user expresses uncertainty (e.g., "I might move to London or Berlin"), capture it with an `is_uncertain=true` or a lower weight.
 
@@ -202,6 +211,7 @@ Follow these key principles:
        "source": "<string>",
        "relationship": "<string>",
        "destination": "<string>",
+       "owner_person_name": "<string or null, required owner of this fact>",
        "weight": "<string from enum>",
        "labels": {
          "source": "<string label>",
@@ -243,6 +253,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "went_to",
       "destination": "Belgrad Forest",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": 
       "source": "Person",
@@ -253,16 +264,18 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "ran_on",
       "destination": "parkour",
+      "owner_person_name": "USER_ID",
       "weight": "relevant",
       "labels": 
       "source": "Person",
       "destination": "Activity"
       }
     ,
-    {
+     {
       "source": "parkour",
       "relationship": "part_of",
       "destination": "Belgrad Forest",
+      "owner_person_name": null,
       "weight": "core_identity",
       "labels": 
       "source": "Activity",
@@ -275,6 +288,7 @@ Expected Output:
 Explanation:
 - The user is performing an activity ("running") at a specific place ("Belgrad Forest") and on a specific sub-location or facility ("parkour"). 
 - The prompt must create a direct link parkour -> part_of -> Belgrad Forest.
+- owner_person_name tracks who owns each fact: we emit the normalized owner name (represented with placeholders like `USER_ID`) so the graph layer can map it to an existing `person_uid` (or create a new one). Entity-only facts keep this field null.
 
 Example B:
 Input:
@@ -287,6 +301,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "wants_to_eat",
       "destination": "salad",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": 
       "source": "Person",
@@ -297,6 +312,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "likes",
       "destination": "caesar salad",
+      "owner_person_name": "USER_ID",
       "weight": "core_identity",
       "labels": 
       "source": "Person",
@@ -307,6 +323,7 @@ Expected Output:
       "source": "caesar salad",
       "relationship": "subtype_of",
       "destination": "salad",
+      "owner_person_name": null,
       "weight": "ritualistic",
       "labels": 
       "source": "Food",
@@ -321,7 +338,7 @@ Explanation:
 
 Example C:
 Input:
-"My roommate and I decided to reduce our screen time."
+"My roommate Alex and I decided to reduce our screen time."
 
 Expected Output:
 
@@ -330,27 +347,29 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "reduces",
       "destination": "screen time",
-      "weight": "important",
-      "labels": {
-        "source": "Person",
-        "destination": "Concept"
-      },
-
-    {
-      "source": "roommate",
-      "relationship": "reduces",
-      "destination": "screen time",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": {
         "source": "Person",
         "destination": "Concept"
       }
-
+    ,
+    {
+      "source": "alex",
+      "relationship": "reduces",
+      "destination": "screen time",
+      "owner_person_name": "alex",
+      "weight": "important",
+      "labels": {
+        "source": "Person",
+        "destination": "Concept"
+      }
+    
   ]
 
 Explanation:
-- Both the user (USER_ID) and their roommate are performing the same action (reducing screen time).
-- The model should produce separate facts for each participant, since both are explicitly mentioned as doing the action.
+- Both the user (USER_ID) and their roommate (alex) are performing the same action (reducing screen time).
+- The model should produce separate facts for each participant, and (per the two-hop rule) also emit USER_ID → has → roommate and roommate → is → alex before these action edges.
 
 Example D (Occupation Node):
 Input:
@@ -360,9 +379,10 @@ Expected Output (summary):
 {
   "facts": [
     {
-      "source": "USER_ID",
-      "relationship": "holds_position",
-      "destination": "job_experience_1",
+     "source": "USER_ID",
+     "relationship": "holds_position",
+     "destination": "job_experience_1",
+      "owner_person_name": "USER_ID",
       "weight": "core_identity",
       "labels": {
         "source": "Person",
@@ -373,6 +393,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "works_at",
       "destination": "Equinix",
+      "owner_person_name": "USER_ID",
       "weight": "core_identity",
       "labels": {
         "source": "Job",
@@ -383,6 +404,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "role",
       "destination": "customer relations operator",
+      "owner_person_name": "USER_ID",
       "weight": "core_identity",
       "labels": {
         "source": "Job",
@@ -393,6 +415,7 @@ Expected Output (summary):
       "source": "job_experience_1",
       "relationship": "duration",
       "destination": "1 year",
+      "owner_person_name": "USER_ID",
       "weight": "core_identity",
       "labels": {
         "source": "Job",
@@ -419,6 +442,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "loves",
       "destination": "new coffee shop downtown",
+      "owner_person_name": "USER_ID",
       "weight": "devotion",
       "labels": {
         "source": "Person",
@@ -430,6 +454,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "appreciates",
       "destination": "barista",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": {
         "source": "Person",
@@ -441,6 +466,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "enjoys",
       "destination": "atmosphere",
+      "owner_person_name": "USER_ID",
       "weight": "ritualistic",
       "labels": {
         "source": "Person",
@@ -452,6 +478,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "tired_of",
       "destination": "limited menu",
+      "owner_person_name": "USER_ID",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -463,6 +490,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "wishes_for",
       "destination": "more variety",
+      "owner_person_name": "USER_ID",
       "weight": "transitional",
       "labels": {
         "source": "Person",
@@ -474,6 +502,7 @@ Expected Output:
       "source": "barista",
       "relationship": "works_at",
       "destination": "new coffee shop downtown",
+      "owner_person_name": "barista",
       "weight": "core_identity",
       "labels": {
         "source": "Person",
@@ -485,6 +514,7 @@ Expected Output:
       "source": "atmosphere",
       "relationship": "part_of",
       "destination": "new coffee shop downtown",
+      "owner_person_name": null,
       "weight": "core_identity",
       "labels": {
         "source": "Concept",
@@ -496,6 +526,7 @@ Expected Output:
       "source": "limited menu",
       "relationship": "part_of",
       "destination": "new coffee shop downtown",
+      "owner_person_name": null,
       "weight": "core_identity",
       "labels": {
         "source": "Concept",
@@ -524,6 +555,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "planning_to_go",
       "destination": "swimming",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": {
         "source": "Person",
@@ -535,6 +567,7 @@ Expected Output:
       "source": "john",
       "relationship": "planning_to_go", 
       "destination": "swimming",
+      "owner_person_name": "john",
       "weight": "important",
       "labels": {
         "source": "Person",
@@ -546,6 +579,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "going_with",
       "destination": "john",
+      "owner_person_name": "USER_ID",
       "weight": "important", 
       "labels": {
         "source": "Person",
@@ -557,6 +591,7 @@ Expected Output:
       "source": "swimming",
       "relationship": "scheduled_for",
       "destination": "tomorrow",
+      "owner_person_name": null,
       "weight": "relevant",
       "labels": {
         "source": "Activity", 
@@ -568,6 +603,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "has",
       "destination": "off_day",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": {
         "source": "Person",
@@ -595,6 +631,7 @@ Expected Output:
       "source": "USER_ID",
       "relationship": "met",
       "destination": "john",
+      "owner_person_name": "USER_ID",
       "weight": "important",
       "labels": {
         "source": "Person",
@@ -606,6 +643,7 @@ Expected Output:
       "source": "john",
       "relationship": "is",
       "destination": "software engineer",
+      "owner_person_name": "john",
       "weight": "core_identity",
       "labels": {
         "source": "Person",
@@ -617,6 +655,7 @@ Expected Output:
       "source": "john",
       "relationship": "likes",
       "destination": "coffee",
+      "owner_person_name": "john",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -639,11 +678,11 @@ Input: "My roommate Alex and my childhood friend Sarah both helped me move."
 Key role facts (showing pattern only):
 {
   "facts": [
-    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "labels": {"source": "Person", "destination": "Role"}},
-    {"source": "roommate", "relationship": "is", "destination": "alex", "labels": {"source": "Role", "destination": "Person"}},
-    {"source": "USER_ID", "relationship": "has", "destination": "friend", "labels": {"source": "Person", "destination": "Role"}},
-    {"source": "friend", "relationship": "is", "destination": "sarah", "labels": {"source": "Role", "destination": "Person"}},
-    {"source": "friend", "relationship": "from_period", "destination": "childhood", "labels": {"source": "Role", "destination": "Time"}}
+    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "owner_person_name": "USER_ID", "labels": {"source": "Person", "destination": "Role"}},
+    {"source": "roommate", "relationship": "is", "destination": "alex", "owner_person_name": "alex", "labels": {"source": "Role", "destination": "Person"}},
+    {"source": "USER_ID", "relationship": "has", "destination": "friend", "owner_person_name": "USER_ID", "labels": {"source": "Person", "destination": "Role"}},
+    {"source": "friend", "relationship": "is", "destination": "sarah", "owner_person_name": "sarah", "labels": {"source": "Role", "destination": "Person"}},
+    {"source": "friend", "relationship": "from_period", "destination": "childhood", "owner_person_name": "USER_ID", "labels": {"source": "Role", "destination": "Time"}}
   ]
 }
 
@@ -660,10 +699,10 @@ Input:
 Expected Output (abbreviated):
 {
   "facts": [
-    {"source": "anil", "relationship": "planning_to_run", "destination": "half_marathon", "labels": {"source": "Person", "destination": "Event"}, "weight": "important", "emotion": "excited"},
-    {"source": "USER_ID", "relationship": "running_with", "destination": "anil", "labels": {"source": "Person", "destination": "Person"}, "weight": "important", "emotion": "enthusiastic"},
-    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "labels": {"source": "Person", "destination": "Role"}, "weight": "relevant", "emotion": "neutral"},
-    {"source": "roommate", "relationship": "is", "destination": "anil", "labels": {"source": "Role", "destination": "Person"}, "weight": "relevant", "emotion": "neutral"}
+    {"source": "anil", "relationship": "planning_to_run", "destination": "half_marathon", "owner_person_name": "anil", "labels": {"source": "Person", "destination": "Event"}, "weight": "important", "emotion": "excited"},
+    {"source": "USER_ID", "relationship": "running_with", "destination": "anil", "owner_person_name": "USER_ID", "labels": {"source": "Person", "destination": "Person"}, "weight": "important", "emotion": "enthusiastic"},
+    {"source": "USER_ID", "relationship": "has", "destination": "roommate", "owner_person_name": "USER_ID", "labels": {"source": "Person", "destination": "Role"}, "weight": "relevant", "emotion": "neutral"},
+    {"source": "roommate", "relationship": "is", "destination": "anil", "owner_person_name": "anil", "labels": {"source": "Role", "destination": "Person"}, "weight": "relevant", "emotion": "neutral"}
   ]
 }
 
@@ -681,6 +720,7 @@ Expected Output:
       "source": "anil",
       "relationship": "went_to",
       "destination": "park",
+      "owner_person_name": "anil",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -692,6 +732,7 @@ Expected Output:
       "source": "sibel",
       "relationship": "went_to", 
       "destination": "park",
+      "owner_person_name": "sibel",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -703,6 +744,7 @@ Expected Output:
       "source": "anil",
       "relationship": "enjoyed",
       "destination": "weather",
+      "owner_person_name": "anil",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -714,6 +756,7 @@ Expected Output:
       "source": "sibel",
       "relationship": "enjoyed",
       "destination": "weather", 
+      "owner_person_name": "sibel",
       "weight": "relevant",
       "labels": {
         "source": "Person",
@@ -725,6 +768,7 @@ Expected Output:
       "source": "anil",
       "relationship": "accompanied_by",
       "destination": "sibel",
+      "owner_person_name": "anil",
       "weight": "relevant",
       "labels": {
         "source": "Person",
