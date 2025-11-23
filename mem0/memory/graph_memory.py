@@ -1,10 +1,17 @@
 import logging
+import json
 from datetime import datetime
 import pytz
 import asyncio
 import threading
 from concurrent.futures import ThreadPoolExecutor
 import uuid
+import math
+
+try:
+    import numpy as _np
+except ImportError:  # pragma: no cover - optional performance boost
+    _np = None
 
 from mem0.memory.utils import format_entities
 
@@ -79,8 +86,42 @@ from mem0.utils.factory import EmbedderFactory, LlmFactory
 
 logger = logging.getLogger(__name__)
 
+PRONOUN_BLACKLIST = {
+    "me",
+    "my",
+    "myself",
+    "he",
+    "she",
+    "they",
+    "him",
+    "her",
+    "them",
+    "his",
+    "hers",
+    "their",
+    "theirs",
+}
+
 
 class MemoryGraph:
+    LABEL_SIMILARITY_THRESHOLDS = {
+        "person": 0.92,
+        "location": 0.88,
+        "organization": 0.9,
+        "role": 0.9,
+        "concept": 0.9,
+        "default": 0.9,
+    }
+    NODE_SEARCH_CANDIDATE_LIMIT = 5
+    CANDIDATE_NEIGHBOR_LIMIT = 10
+    CANDIDATE_TIE_DELTA = 0.03
+    HIGH_SIM_NEAR_THRESHOLD_DELTA = 0.02
+    CONTEXT_MATCH_THRESHOLD = 0.85
+    CONTEXT_MATCH_BONUS = 0.04
+    CONTEXT_BUCKET_PENALTY = 0.05
+    NO_CONTEXT_OVERLAP_SCALE = 0.5
+    PROFILE_CONTRADICTION_PENALTY = 0.45
+
     def __init__(self, config):
         self.config = config
         self.graph = Neo4jGraph(
@@ -104,6 +145,44 @@ class MemoryGraph:
         
         # Thread pool for background weight adjustments
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="weight_adjuster")
+
+    def _get_label_threshold(self, label):
+        """
+        Returns the cosine similarity threshold for a specific label, defaulting to a global value.
+        """
+        if not label:
+            return self.LABEL_SIMILARITY_THRESHOLDS["default"]
+        return self.LABEL_SIMILARITY_THRESHOLDS.get(
+            label.lower(), self.LABEL_SIMILARITY_THRESHOLDS["default"]
+        )
+
+    def _cosine_similarity(self, vec1, vec2):
+        """Compute cosine similarity while guarding against zero vectors."""
+        if not vec1 or not vec2:
+            return 0.0
+        length = min(len(vec1), len(vec2))
+        if length == 0:
+            return 0.0
+        if _np is not None:
+            v1 = _np.asarray(vec1[:length])
+            v2 = _np.asarray(vec2[:length])
+            denom = _np.linalg.norm(v1) * _np.linalg.norm(v2)
+            if denom == 0:
+                return 0.0
+            return float(_np.dot(v1, v2) / denom)
+
+        dot = 0.0
+        norm1 = 0.0
+        norm2 = 0.0
+        for i in range(length):
+            a = vec1[i]
+            b = vec2[i]
+            dot += a * b
+            norm1 += a * a
+            norm2 += b * b
+        if not norm1 or not norm2:
+            return 0.0
+        return dot / (math.sqrt(norm1) * math.sqrt(norm2))
 
     def _analyze_relation_evolution(self, current_relation, session_history, graph_context, user_id):
         """
@@ -245,6 +324,8 @@ Return updated weight, emotion, status, and analysis flags."""
         """
         # Step 1: Retrieve nodes from data
         entity_type_map = self._retrieve_nodes_from_data(data, filters)
+        node_names = list(entity_type_map.keys())
+        node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
         
         # Step 2: Establish relations from data
         to_be_added = self._establish_nodes_relations_from_data(
@@ -253,7 +334,7 @@ Return updated weight, emotion, status, and analysis flags."""
         
         # Step 3: Search graph database
         search_output = self._search_graph_db(
-            node_list=list(entity_type_map.keys()), filters=filters
+            node_list=node_names, node_labels=node_labels, filters=filters
         )
         
         # Step 4: Analyze and update existing relations
@@ -337,10 +418,12 @@ Return updated weight, emotion, status, and analysis flags."""
         """
         # Step 1: Retrieve nodes from query
         entity_type_map = self._retrieve_nodes_from_data(query, filters)
+        node_names = list(entity_type_map.keys())
+        node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
         
         # Step 2: Search graph database
         search_output = self._search_graph_db(
-            node_list=list(entity_type_map.keys()), filters=filters
+            node_list=node_names, node_labels=node_labels, filters=filters
         )
 
         if not search_output:
@@ -579,8 +662,27 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         entity_type_map = {}
 
         try:
-            for item in search_results["tool_calls"][0]["arguments"]["entities"]:
-                entity_type_map[item["entity"]] = item["entity_type"]
+            raw_entities = []
+            tool_calls = search_results.get("tool_calls") or []
+            if tool_calls:
+                raw_entities = tool_calls[0].get("arguments", {}).get("entities", [])
+            else:
+                raw_content = search_results.get("content")
+                if raw_content:
+                    try:
+                        parsed = json.loads(raw_content)
+                        raw_entities = parsed.get("entities", [])
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to parse entity extractor content as JSON: %s",
+                            raw_content,
+                        )
+
+            for item in raw_entities:
+                entity = item.get("entity")
+                entity_type = item.get("entity_type")
+                if entity and entity_type:
+                    entity_type_map[entity] = entity_type
         except Exception as e:
             logger.exception(
                 f"Error in search tool: {e}, llm_provider={self.llm_provider}, search_results={search_results}"
@@ -647,77 +749,142 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         logger.debug(f"Extracted entities: {extracted_entities}")
         return extracted_entities
 
-    def _search_graph_db(self, node_list, filters, limit=100):
-        """Search similar nodes among and their respective incoming and outgoing relations."""
+    def _search_graph_db(self, node_list, filters, node_labels=None, limit=100):
+        """Search similar nodes and expand their relations with label-aware filtering."""
         if not node_list:
             return []
 
-        # Prepare a list of nodes with their embeddings to pass as a single parameter
-        nodes_with_embeddings = [
-            {"name": node, "embedding": self.embedding_model.embed(node)}
-            for node in node_list
-        ]
+        node_labels = node_labels or []
+        base_entries = []
+        for idx, node in enumerate(node_list):
+            label = node_labels[idx] if idx < len(node_labels) else None
+            label_norm = label.lower() if isinstance(label, str) else None
+            label_filter = label_norm if label_norm and label_norm != "unknown" else None
+            base_entries.append(
+                {
+                    "name": node,
+                    "label": label_norm,
+                    "label_filter": label_filter,
+                    "label_threshold": self._get_label_threshold(label_norm),
+                    "global_threshold": self.threshold,
+                    "embedding": self.embedding_model.embed(node),
+                }
+            )
 
-        # This single, optimized query implements the "Anchor-Expand" pattern.
-        # EFFICIENT: Similarity calculation happens only once in Step 2 to find anchors.
-        # The UNION in Step 3 does NOT recalculate similarity - it just expands from pre-found anchors.
-        cypher_query = """
-        // Step 1: UNWIND the list of nodes to process them in a batch.
-        UNWIND $nodes_with_embeddings AS search_item
-        
-        // Step 2: Find "anchor" nodes via vector similarity search (ONCE ONLY).
-        MATCH (n)
-        WHERE n.embedding IS NOT NULL AND n.user_id = $user_id
-        WITH search_item, n, round(2 * vector.similarity.cosine(n.embedding, search_item.embedding) - 1, 4) AS similarity
-        WHERE similarity >= $threshold
+        def _prepare_search_items(entries, use_label_filter):
+            prepared = []
+            for entry in entries:
+                prepared.append(
+                    {
+                        "name": entry["name"],
+                        "embedding": entry["embedding"],
+                        "threshold": entry["label_threshold"] if use_label_filter else entry["global_threshold"],
+                        "label_filter": entry["label_filter"] if use_label_filter else None,
+                    }
+                )
+            return prepared
 
-        // Order by similarity and limit to the top N results for each search item
-        WITH search_item, n, similarity
-        ORDER BY similarity DESC
-        WITH search_item, collect({n: n, similarity: similarity})[..$limit] AS top_nodes
-        UNWIND top_nodes AS top_node
-        WITH top_node.n AS n, top_node.similarity AS similarity
+        def _execute_anchor_query(search_items, require_label_match):
+            if not search_items:
+                return []
 
-        // Step 3: From the anchors, expand bidirectionally using a CALL subquery.
-        // EFFICIENT: No redundant similarity calculation here - 'n' is already the anchor.
-        CALL (n) {
-            MATCH (n)-[r]->(m)
-            WHERE m.user_id = $user_id
-            RETURN n.name AS source, elementId(n) AS source_id, labels(n) AS source_labels, n.person_uid AS source_person_uid,
-                   type(r) AS relatationship, elementId(r) AS relation_id, 
-                   m.name AS destination, elementId(m) AS destination_id, labels(m) AS destination_labels, m.person_uid AS destination_person_uid,
-                   r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
-                   r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
-                   r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
-            UNION
-            MATCH (m)-[r]->(n)
-            WHERE m.user_id = $user_id
-            RETURN m.name AS source, elementId(m) AS source_id, labels(m) AS source_labels, m.person_uid AS source_person_uid,
-                   type(r) AS relatationship, elementId(r) AS relation_id,
-                   n.name AS destination, elementId(n) AS destination_id, labels(n) AS destination_labels, n.person_uid AS destination_person_uid,
-                   r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
-                   r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
-                   r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
-        }
-        // Step 4: De-duplicate and return the final results with all rich metadata.
-        WITH DISTINCT source, source_id, source_labels, source_person_uid, relatationship, relation_id, 
-             destination, destination_id, destination_labels, destination_person_uid, similarity,
-             weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
-        RETURN source, source_id, source_labels, source_person_uid, relatationship, relation_id, 
-               destination, destination_id, destination_labels, destination_person_uid, similarity,
-               weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
-        """
+            cypher_query = """
+            UNWIND $search_items AS search_item
+            MATCH (n)
+            WHERE n.embedding IS NOT NULL 
+              AND n.user_id = $user_id
+            WITH search_item, n, [label IN labels(n) | toLower(label)] AS node_labels
+            WHERE $require_label_match = false OR (
+                search_item.label_filter IS NOT NULL AND search_item.label_filter IN node_labels
+            )
+            WITH search_item, n,
+                 round(2 * vector.similarity.cosine(n.embedding, search_item.embedding) - 1, 4) AS similarity
+            WHERE similarity >= search_item.threshold
+            WITH search_item, n, similarity
+            ORDER BY similarity DESC
+            WITH search_item, collect({n: n, similarity: similarity})[..$limit] AS top_nodes
+            UNWIND top_nodes AS top_node
+            WITH search_item, top_node.n AS n, top_node.similarity AS similarity, $require_label_match AS require_label_match
+            CALL (n) {
+                MATCH (n)-[r]->(m)
+                WHERE m.user_id = $user_id
+                RETURN n.name AS source, elementId(n) AS source_id, labels(n) AS source_labels, n.person_uid AS source_person_uid,
+                       type(r) AS relatationship, elementId(r) AS relation_id, 
+                       m.name AS destination, elementId(m) AS destination_id, labels(m) AS destination_labels, m.person_uid AS destination_person_uid,
+                       r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                       r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                       r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
+                UNION
+                MATCH (m)-[r]->(n)
+                WHERE m.user_id = $user_id
+                RETURN m.name AS source, elementId(m) AS source_id, labels(m) AS source_labels, m.person_uid AS source_person_uid,
+                       type(r) AS relatationship, elementId(r) AS relation_id,
+                       n.name AS destination, elementId(n) AS destination_id, labels(n) AS destination_labels, n.person_uid AS destination_person_uid,
+                       r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                       r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                       r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
+            }
+            WITH DISTINCT search_item.name AS search_term, require_label_match,
+                 source, source_id, source_labels, source_person_uid, relatationship, relation_id,
+                 destination, destination_id, destination_labels, destination_person_uid, similarity,
+                 weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+            RETURN search_term, NOT require_label_match AS used_fallback,
+                   source, source_id, source_labels, source_person_uid, relatationship, relation_id,
+                   destination, destination_id, destination_labels, destination_person_uid, similarity,
+                   weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+            """
 
-        params = {
-            "nodes_with_embeddings": nodes_with_embeddings,
-            "threshold": self.threshold,
-            "user_id": filters["user_id"],
-            "limit": limit,
-        }
+            params = {
+                "search_items": search_items,
+                "user_id": filters["user_id"],
+                "limit": limit,
+                "require_label_match": require_label_match,
+            }
+            return self.graph.query(cypher_query, params=params)
 
-        result_relations = self.graph.query(cypher_query, params=params)
+        label_entries = [entry for entry in base_entries if entry["label_filter"]]
+        label_results = _execute_anchor_query(
+            _prepare_search_items(label_entries, use_label_filter=True),
+            require_label_match=True,
+        )
 
-        return result_relations
+        seen_terms = {row.get("search_term") for row in label_results if row.get("search_term")}
+        fallback_targets = []
+        fallback_target_names = set()
+        for entry in base_entries:
+            if entry["name"] not in seen_terms:
+                fallback_targets.append(entry)
+                fallback_target_names.add(entry["name"])
+
+        # Log which entries had to fall back after attempting label-specific anchors
+        for entry in label_entries:
+            if entry["name"] in fallback_target_names:
+                logger.info(
+                    "[label_fallback] entity=%s label=%s threshold=%.3f",
+                    entry["name"],
+                    entry["label"],
+                    entry["label_threshold"],
+                )
+
+        fallback_results = _execute_anchor_query(
+            _prepare_search_items(fallback_targets, use_label_filter=False),
+            require_label_match=False,
+        )
+
+        deduped = []
+        seen_rel_ids = set()
+        for record in label_results + fallback_results:
+            key = (
+                record.get("relation_id"),
+                record.get("source_id"),
+                record.get("destination_id"),
+            )
+            if key in seen_rel_ids:
+                continue
+            seen_rel_ids.add(key)
+            deduped.append(record)
+
+        return deduped
 
     def _get_delete_entities_from_search_output(self, search_output, data, filters):
         """Get the entities to be deleted from the search output."""
@@ -808,6 +975,13 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         """
         results = []
         logger.debug(f"Adding entities. `to_be_added`: {to_be_added}")
+
+        embedding_cache = {}
+
+        def _get_embedding(term):
+            if term not in embedding_cache:
+                embedding_cache[term] = self.embedding_model.embed(term)
+            return embedding_cache[term]
         
         # Build existing person profiles from search output
         existing_person_profiles = self._build_person_profiles(search_output, entity_type_map)
@@ -835,12 +1009,18 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     }
                 
                 # Build outgoing fact record
+                target_embedding = None
+                if destination and destination not in PRONOUN_BLACKLIST:
+                    target_embedding = _get_embedding(destination)
+
                 fact_record = {
                     "direction": "out",
                     "relationship": relationship,
                     "target_name": destination,
                     "target_uid": None,  # Will be filled if destination is also a new person with UID
                     "target_type": dest_type,
+                    "target_label": dest_type,
+                    "target_embedding": target_embedding,
                     "metadata": {
                         "weight": item.get("weight"),
                         "is_uncertain": item.get("is_uncertain"),
@@ -863,12 +1043,18 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     }
                 
                 # Build incoming fact record
+                target_embedding = None
+                if source and source not in PRONOUN_BLACKLIST:
+                    target_embedding = _get_embedding(source)
+
                 fact_record = {
                     "direction": "in",
                     "relationship": relationship,
                     "target_name": source,
                     "target_uid": None,  # Will be filled if source is also a new person with UID
                     "target_type": source_type,
+                    "target_label": source_type,
+                    "target_embedding": target_embedding,
                     "metadata": {
                         "weight": item.get("weight"),
                         "is_uncertain": item.get("is_uncertain"),
@@ -895,6 +1081,24 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             skip_disambiguation_for_user = (
                 user_id_normalized is not None and person_name == user_id_normalized
             )
+            context_nodes = []
+            for fact in new_profile.get("facts", []):
+                target_name = fact.get("target_name")
+                if not target_name:
+                    continue
+                labels = []
+                target_label = fact.get("target_label") or fact.get("target_type")
+                if target_label:
+                    labels.append(target_label)
+                context_nodes.append(
+                    {
+                        "name": target_name,
+                        "labels": labels,
+                        "embedding": fact.get("target_embedding"),
+                        "relationship": fact.get("relationship"),
+                        "direction": fact.get("direction"),
+                    }
+                )
             
             if skip_disambiguation_for_user:
                 if existing_profiles_for_name:
@@ -924,7 +1128,165 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                         person_name,
                     )
             else:
-                decision = self._select_person_candidate(person_name, new_profile, existing_profiles_for_name)
+                person_embedding = _get_embedding(person_name)
+                person_candidates = self._search_source_node(
+                    person_embedding,
+                    user_id,
+                    label="person",
+                    limit=self.NODE_SEARCH_CANDIDATE_LIMIT,
+                )
+
+                profile_comparisons = {}
+                for profile in existing_profiles_for_name:
+                    element_id = profile.get("element_id")
+                    if not element_id:
+                        continue
+                    profile_comparisons[element_id] = self._compare_person_profiles(
+                        profile, new_profile
+                    )
+
+                candidate_neighbor_map = self._get_candidate_neighbor_names(
+                    [candidate["node_id"] for candidate in person_candidates],
+                    user_id,
+                )
+
+                scoring_result = self._score_entity_candidates(
+                    {"name": person_name, "type": "person"},
+                    person_candidates,
+                    metadata={
+                        "context_nodes": context_nodes,
+                        "candidate_neighbors": candidate_neighbor_map,
+                        "profile_comparisons": profile_comparisons,
+                        "tie_delta": 0.04,
+                    },
+                )
+                best_candidate = scoring_result.get("candidate")
+                best_score = scoring_result.get("score", 0.0)
+                tie = scoring_result.get("tie", False)
+                overlap_labels = scoring_result.get("overlap_labels") or []
+                penalties_applied = scoring_result.get("penalties_applied", False)
+                context_bucket_count = scoring_result.get("context_bucket_count", 0)
+                score_entries = scoring_result.get("scores", [])
+                best_details = score_entries[0] if score_entries else {}
+                base_similarity = best_details.get("similarity", 0.0)
+                penalty_reasons = set()
+                for penalty in best_details.get("penalties", []):
+                    reason = penalty.get("reason") or penalty.get("type")
+                    if reason:
+                        penalty_reasons.add(reason)
+                context_penalty_reasons = {"no_overlap", "no_context_overlap"}
+                context_penalties_only = (
+                    not penalty_reasons
+                    or penalty_reasons.issubset(context_penalty_reasons)
+                )
+                matched_profile = None
+                if best_candidate:
+                    matched_profile = next(
+                        (
+                            profile
+                            for profile in existing_profiles_for_name
+                            if profile.get("element_id") == best_candidate.get("node_id")
+                        ),
+                        None,
+                    )
+                profile_result = None
+                if best_candidate:
+                    profile_result = profile_comparisons.get(
+                        best_candidate.get("node_id")
+                    )
+
+                person_threshold = self._get_label_threshold("person")
+                has_context_overlap = bool(overlap_labels)
+                allow_reuse = has_context_overlap or profile_result == "match"
+                near_threshold = (
+                    best_candidate
+                    and best_score >= person_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA
+                )
+                penalties_triggered = penalties_applied or (
+                    context_bucket_count > 0 and not has_context_overlap
+                )
+                existing_count = len(existing_profiles_for_name)
+                single_existing_profile = existing_count == 1
+                allow_reuse_without_overlap = (
+                    best_candidate
+                    and not allow_reuse
+                    and not has_context_overlap
+                    and single_existing_profile
+                    and matched_profile is not None
+                    and profile_result != "contradict"
+                    and context_penalties_only
+                    and (
+                        best_score >= person_threshold
+                        or base_similarity >= person_threshold
+                    )
+                )
+                if tie:
+                    decision = {
+                        "decision": "ambiguous",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": scoring_result.get("scores", []),
+                        "candidates": person_candidates,
+                    }
+                elif best_candidate and best_score >= person_threshold and allow_reuse:
+                    decision = {
+                        "decision": "reuse",
+                        "element_id": best_candidate.get("node_id"),
+                        "person_uid": best_candidate.get("person_uid"),
+                        "matched_profile": matched_profile,
+                        "all_comparisons": scoring_result.get("scores", []),
+                    }
+                elif best_candidate and allow_reuse_without_overlap:
+                    logger.info(
+                        "[person_reuse_fallback] name=%s reason=single_profile_no_overlap",
+                        person_name,
+                    )
+                    decision = {
+                        "decision": "reuse",
+                        "element_id": best_candidate.get("node_id"),
+                        "person_uid": best_candidate.get("person_uid"),
+                        "matched_profile": matched_profile,
+                        "all_comparisons": scoring_result.get("scores", []),
+                    }
+                elif best_candidate and best_score >= person_threshold and not allow_reuse:
+                    decision = {
+                        "decision": "unconfirmed",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": scoring_result.get("scores", []),
+                        "existing_count": existing_count,
+                        "candidates": person_candidates,
+                    }
+                elif best_candidate and near_threshold and penalties_triggered:
+                    decision = {
+                        "decision": "unconfirmed",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": scoring_result.get("scores", []),
+                        "existing_count": existing_count,
+                        "candidates": person_candidates,
+                    }
+                elif best_candidate or existing_profiles_for_name:
+                    decision = {
+                        "decision": "unconfirmed",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": scoring_result.get("scores", []),
+                        "existing_count": existing_count,
+                        "candidates": person_candidates,
+                    }
+                else:
+                    decision = {
+                        "decision": "new",
+                        "element_id": None,
+                        "person_uid": None,
+                        "matched_profile": None,
+                        "all_comparisons": scoring_result.get("scores", []),
+                    }
             
             person_decisions[person_name] = decision
             
@@ -940,12 +1302,12 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                         message=f"Cannot disambiguate '{person_name}': {len(decision.get('candidates', []))} existing nodes match equally. Please specify which person you mean."
                     )
                 elif decision["decision"] == "unconfirmed":
-                    logger.warning(f"Unconfirmed person match for '{person_name}'. No clear overlap with {decision['existing_count']} existing node(s).")
+                    logger.warning(f"Unconfirmed person match for '{person_name}'. No clear overlap with {decision.get('existing_count', 0)} existing node(s).")
                     raise UnconfirmedPersonException(
                         person_name=person_name,
-                        existing_count=decision['existing_count'],
+                        existing_count=decision.get("existing_count", 0),
                         new_profile=new_profile,
-                        message=f"Is '{person_name}' a new person? {decision['existing_count']} existing node(s) found but no relationship overlap detected."
+                        message=f"Is '{person_name}' a new person? {decision.get('existing_count', 0)} existing node(s) found but no relationship overlap detected."
                     )
             
             # If decision is "new", generate and cache the person_uid now
@@ -981,8 +1343,8 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             destination_type = entity_type_map.get(destination, "unknown")
 
             # embeddings
-            source_embedding = self.embedding_model.embed(source)
-            dest_embedding = self.embedding_model.embed(destination)
+            source_embedding = _get_embedding(source)
+            dest_embedding = _get_embedding(destination)
 
             # additional parameters
             weight = item.get("weight")
@@ -994,17 +1356,51 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             last_mentioned = item.get("last_mentioned")
             usage_count = item.get("usage_count")
 
+            def _build_relationship_properties(alias):
+                clauses = []
+                rel_params = {}
+                if weight is not None:
+                    clauses.append(f"{alias}.weight = $weight")
+                    rel_params["weight"] = weight
+                if is_uncertain is not None:
+                    clauses.append(f"{alias}.is_uncertain = $is_uncertain")
+                    rel_params["is_uncertain"] = is_uncertain
+                if status is not None:
+                    clauses.append(f"{alias}.status = $status")
+                    rel_params["status"] = status
+                if start_date is not None:
+                    clauses.append(f"{alias}.start_date = $start_date")
+                    rel_params["start_date"] = start_date
+                if end_date is not None:
+                    clauses.append(f"{alias}.end_date = $end_date")
+                    rel_params["end_date"] = end_date
+                if emotion is not None:
+                    clauses.append(f"{alias}.emotion = $emotion")
+                    rel_params["emotion"] = emotion
+                if last_mentioned is not None:
+                    clauses.append(f"{alias}.last_mentioned = $last_mentioned")
+                    rel_params["last_mentioned"] = last_mentioned
+                if usage_count is not None:
+                    clauses.append(f"{alias}.usage_count = $usage_count")
+                    rel_params["usage_count"] = usage_count
+
+                additional_set_properties_str = ""
+                if clauses:
+                    additional_set_properties_str = ", " + ", ".join(clauses)
+                return additional_set_properties_str, rel_params
+
             # For person nodes, use the decision from person_decisions instead of embedding search
             # This enables proper person disambiguation
             source_node_search_result = None
             destination_node_search_result = None
             source_person_uid_to_use = None
             dest_person_uid_to_use = None
+            source_best_score = 0.0
+            dest_best_score = 0.0
             
             if source_type == "person" and source in person_decisions:
                 decision = person_decisions[source]
                 if decision["decision"] == "reuse":
-                    # Create a result structure that matches what _search_source_node returns
                     source_node_search_result = [{"elementId(source_candidate)": decision["element_id"]}]
                     source_person_uid_to_use = decision["person_uid"]
                     logger.debug(f"Reusing existing person node for source '{source}' with person_uid={source_person_uid_to_use}")
@@ -1014,10 +1410,47 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     logger.debug(f"Creating new person node for source '{source}' with cached person_uid={source_person_uid_to_use}")
                     # source_node_search_result remains None to trigger the "new node" branch
             else:
-                # Not a person or not in decisions - use embedding search as before
-                source_node_search_result = self._search_source_node(
-                    source_embedding, user_id, threshold=0.9
+                source_candidates = self._search_source_node(
+                    source_embedding,
+                    user_id,
+                    label=source_type,
+                    limit=self.NODE_SEARCH_CANDIDATE_LIMIT,
                 )
+                candidate_neighbor_map = self._get_candidate_neighbor_names(
+                    [candidate["node_id"] for candidate in source_candidates],
+                    user_id,
+                )
+                source_scoring = self._score_entity_candidates(
+                    {"name": source, "type": source_type},
+                    source_candidates,
+                    metadata={
+                        "context_nodes": [
+                            {
+                                "name": destination,
+                                "labels": [destination_type],
+                                "embedding": dest_embedding,
+                            }
+                        ],
+                        "candidate_neighbors": candidate_neighbor_map,
+                        "tie_delta": self.CANDIDATE_TIE_DELTA,
+                    },
+                )
+                source_best_candidate = source_scoring.get("candidate")
+                source_best_score = source_scoring.get("score", 0.0)
+                source_threshold = self._get_label_threshold(source_type)
+                if source_best_candidate and source_best_score >= source_threshold:
+                    source_node_search_result = [
+                        {"elementId(source_candidate)": source_best_candidate["node_id"]}
+                    ]
+                else:
+                    if source_best_candidate and source_best_score >= source_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA:
+                        logger.info(
+                            "[candidate_rejected] entity=%s label=%s score=%.4f threshold=%.4f",
+                            source,
+                            source_type,
+                            source_best_score,
+                            source_threshold,
+                        )
             
             if destination_type == "person" and destination in person_decisions:
                 decision = person_decisions[destination]
@@ -1030,39 +1463,54 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     dest_person_uid_to_use = person_uid_cache.get(destination)
                     logger.debug(f"Creating new person node for destination '{destination}' with cached person_uid={dest_person_uid_to_use}")
             else:
-                # Not a person or not in decisions - use embedding search
-                destination_node_search_result = self._search_destination_node(
-                    dest_embedding, user_id, threshold=0.9
+                destination_candidates = self._search_destination_node(
+                    dest_embedding,
+                    user_id,
+                    label=destination_type,
+                    limit=self.NODE_SEARCH_CANDIDATE_LIMIT,
                 )
+                destination_neighbor_map = self._get_candidate_neighbor_names(
+                    [candidate["node_id"] for candidate in destination_candidates],
+                    user_id,
+                )
+                destination_scoring = self._score_entity_candidates(
+                    {"name": destination, "type": destination_type},
+                    destination_candidates,
+                    metadata={
+                        "context_nodes": [
+                            {
+                                "name": source,
+                                "labels": [source_type],
+                                "embedding": source_embedding,
+                            }
+                        ],
+                        "candidate_neighbors": destination_neighbor_map,
+                        "tie_delta": self.CANDIDATE_TIE_DELTA,
+                    },
+                )
+                destination_best_candidate = destination_scoring.get("candidate")
+                dest_best_score = destination_scoring.get("score", 0.0)
+                dest_threshold = self._get_label_threshold(destination_type)
+                if destination_best_candidate and dest_best_score >= dest_threshold:
+                    destination_node_search_result = [
+                        {"elementId(destination_candidate)": destination_best_candidate["node_id"]}
+                    ]
+                else:
+                    if destination_best_candidate and dest_best_score >= dest_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA:
+                        logger.info(
+                            "[candidate_rejected] entity=%s label=%s score=%.4f threshold=%.4f",
+                            destination,
+                            destination_type,
+                            dest_best_score,
+                            dest_threshold,
+                        )
 
             logger.debug(f"Processing item: {item}. Source found: {bool(source_node_search_result)}. Destination found: {bool(destination_node_search_result)}")
 
             # TODO: Create a cypher query and common params for all the cases
             if not destination_node_search_result and source_node_search_result:
                 current_formatted_time = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-                
-                # Build SET clauses for relationship properties
-                relationship_set_clauses = []
-                if weight is not None:
-                    relationship_set_clauses.append("r.weight = $weight")
-                if is_uncertain is not None:
-                    relationship_set_clauses.append("r.is_uncertain = $is_uncertain")
-                if status is not None:
-                    relationship_set_clauses.append("r.status = $status")
-                if start_date is not None:
-                    relationship_set_clauses.append("r.start_date = $start_date")
-                if end_date is not None:
-                    relationship_set_clauses.append("r.end_date = $end_date")
-                if emotion is not None:
-                    relationship_set_clauses.append("r.emotion = $emotion")
-                if last_mentioned is not None:
-                    relationship_set_clauses.append("r.last_mentioned = $last_mentioned")
-                if usage_count is not None:
-                    relationship_set_clauses.append("r.usage_count = $usage_count")
-                
-                additional_set_properties_str = ""
-                if relationship_set_clauses:
-                    additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
+                additional_set_properties_str, rel_params = _build_relationship_properties("r")
 
                 # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
                 # For other nodes or existing persons, use standard MERGE on (name, user_id)
@@ -1135,24 +1583,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                         "user_id": user_id,
                         "current_formatted_time": current_formatted_time,
                     }
-
-                # Add additional parameters to params if they exist
-                if weight is not None:
-                    params["weight"] = weight
-                if is_uncertain is not None:
-                    params["is_uncertain"] = is_uncertain
-                if status is not None:
-                    params["status"] = status
-                if start_date is not None:
-                    params["start_date"] = start_date
-                if end_date is not None:
-                    params["end_date"] = end_date
-                if emotion is not None:
-                    params["emotion"] = emotion
-                if last_mentioned is not None:
-                    params["last_mentioned"] = last_mentioned
-                if usage_count is not None:
-                    params["usage_count"] = usage_count
+                params.update(rel_params)
 
                 logger.debug(f"Executing Cypher (source exists): {cypher} with params: {params}")
                 resp = self.graph.query(cypher, params=params)
@@ -1161,29 +1592,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
 
             elif destination_node_search_result and not source_node_search_result:
                 current_formatted_time = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-                # Build SET clauses for relationship properties
-                relationship_set_clauses = []
-                if weight is not None:
-                    relationship_set_clauses.append("r.weight = $weight")
-                if is_uncertain is not None:
-                    relationship_set_clauses.append("r.is_uncertain = $is_uncertain")
-                if status is not None:
-                    relationship_set_clauses.append("r.status = $status")
-                if start_date is not None:
-                    relationship_set_clauses.append("r.start_date = $start_date")
-                if end_date is not None:
-                    relationship_set_clauses.append("r.end_date = $end_date")
-                if emotion is not None:
-                    relationship_set_clauses.append("r.emotion = $emotion")
-                if last_mentioned is not None:
-                    relationship_set_clauses.append("r.last_mentioned = $last_mentioned")
-                if usage_count is not None:
-                    relationship_set_clauses.append("r.usage_count = $usage_count")
-
-                additional_set_properties_str = ""
-                if relationship_set_clauses:
-                    additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
+                additional_set_properties_str, rel_params = _build_relationship_properties("r")
 
                 # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
                 # For other nodes or existing persons, use standard MERGE on (name, user_id)
@@ -1255,24 +1664,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                         "user_id": user_id,
                         "current_formatted_time": current_formatted_time,
                     }
-
-                # Add additional parameters to params if they exist
-                if weight is not None:
-                    params["weight"] = weight
-                if is_uncertain is not None:
-                    params["is_uncertain"] = is_uncertain
-                if status is not None:
-                    params["status"] = status
-                if start_date is not None:
-                    params["start_date"] = start_date
-                if end_date is not None:
-                    params["end_date"] = end_date
-                if emotion is not None:
-                    params["emotion"] = emotion
-                if last_mentioned is not None:
-                    params["last_mentioned"] = last_mentioned
-                if usage_count is not None:
-                    params["usage_count"] = usage_count
+                params.update(rel_params)
 
                 logger.debug(f"Executing Cypher (destination exists): {cypher} with params: {params}")
                 resp = self.graph.query(cypher, params=params)
@@ -1281,33 +1673,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
 
             elif source_node_search_result and destination_node_search_result:
                 current_formatted_time = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-                # Build SET clauses for relationship properties
-                relationship_set_clauses = []
-                if weight is not None:
-                    relationship_set_clauses.append("r.weight = $weight")
-                if is_uncertain is not None:
-                    relationship_set_clauses.append("r.is_uncertain = $is_uncertain")
-                if status is not None:
-                    relationship_set_clauses.append("r.status = $status")
-                if start_date is not None:
-                    relationship_set_clauses.append("r.start_date = $start_date")
-                if end_date is not None:
-                    relationship_set_clauses.append("r.end_date = $end_date")
-                if emotion is not None:
-                    relationship_set_clauses.append("r.emotion = $emotion")
-                if last_mentioned is not None:
-                    relationship_set_clauses.append("r.last_mentioned = $last_mentioned")
-                if usage_count is not None:
-                    relationship_set_clauses.append("r.usage_count = $usage_count")
-
-                additional_set_properties_str = ""
-                # For this case, r.updated_at is also set, so check if relationship_set_clauses is non-empty
-                # to decide if a comma is needed before r.updated_at or before the additional properties.
-                # However, the original code sets r.created_at and r.updated_at unconditionally on merge.
-                # We'll stick to adding optional properties after these.
-                if relationship_set_clauses:
-                    additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
+                additional_set_properties_str, rel_params = _build_relationship_properties("r")
 
                 cypher = f"""
                     MATCH (source)
@@ -1337,24 +1703,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     "relationship": relationship,
                     "current_formatted_time": current_formatted_time,
                 }
-
-                # Add additional parameters to params if they exist
-                if weight is not None:
-                    params["weight"] = weight
-                if is_uncertain is not None:
-                    params["is_uncertain"] = is_uncertain
-                if status is not None:
-                    params["status"] = status
-                if start_date is not None:
-                    params["start_date"] = start_date
-                if end_date is not None:
-                    params["end_date"] = end_date
-                if emotion is not None:
-                    params["emotion"] = emotion
-                if last_mentioned is not None:
-                    params["last_mentioned"] = last_mentioned
-                if usage_count is not None:
-                    params["usage_count"] = usage_count
+                params.update(rel_params)
 
                 logger.debug(f"Executing Cypher (both exist): {cypher} with params: {params}")
                 resp = self.graph.query(cypher, params=params)
@@ -1363,29 +1712,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
 
             elif not source_node_search_result and not destination_node_search_result:
                 current_formatted_time = datetime.now(pytz.utc).strftime('%Y-%m-%d %H:%M:%S')
-
-                # Build SET clauses for relationship properties
-                relationship_set_clauses = [] # Note: using 'rel' here as per original query
-                if weight is not None:
-                    relationship_set_clauses.append("rel.weight = $weight")
-                if is_uncertain is not None:
-                    relationship_set_clauses.append("rel.is_uncertain = $is_uncertain")
-                if status is not None:
-                    relationship_set_clauses.append("rel.status = $status")
-                if start_date is not None:
-                    relationship_set_clauses.append("rel.start_date = $start_date")
-                if end_date is not None:
-                    relationship_set_clauses.append("rel.end_date = $end_date")
-                if emotion is not None:
-                    relationship_set_clauses.append("rel.emotion = $emotion")
-                if last_mentioned is not None:
-                    relationship_set_clauses.append("rel.last_mentioned = $last_mentioned")
-                if usage_count is not None:
-                    relationship_set_clauses.append("rel.usage_count = $usage_count")
-                
-                additional_set_properties_str = ""
-                if relationship_set_clauses:
-                    additional_set_properties_str = ", " + ", ".join(relationship_set_clauses)
+                additional_set_properties_str, rel_params = _build_relationship_properties("rel")
 
                 # For person nodes with new person_uid, include it in MERGE to ensure distinct nodes
                 # For other nodes, use standard MERGE on (name, user_id)
@@ -1442,24 +1769,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     params["source_person_uid"] = source_person_uid_to_use
                 if destination_type == "person" and dest_person_uid_to_use:
                     params["dest_person_uid"] = dest_person_uid_to_use
-
-                # Add additional parameters to params if they exist
-                if weight is not None:
-                    params["weight"] = weight
-                if is_uncertain is not None:
-                    params["is_uncertain"] = is_uncertain
-                if status is not None:
-                    params["status"] = status
-                if start_date is not None:
-                    params["start_date"] = start_date
-                if end_date is not None:
-                    params["end_date"] = end_date
-                if emotion is not None:
-                    params["emotion"] = emotion
-                if last_mentioned is not None:
-                    params["last_mentioned"] = last_mentioned
-                if usage_count is not None:
-                    params["usage_count"] = usage_count
+                params.update(rel_params)
 
                 logger.debug(f"Executing Cypher (neither exist): {cypher} with params: {params}")
                 resp = self.graph.query(cypher, params=params)
@@ -1469,6 +1779,321 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         logger.debug(f"Finished adding entities. Results: {results}")
         return results
 
+    def _score_entity_candidates(self, entity_record, candidates, metadata=None):
+        """
+        Score candidate nodes for a given entity using cosine similarity, label matches, and context overlaps.
+
+        Args:
+            entity_record (dict): Contains at least {"name": str, "type": str}.
+            candidates (list): List of candidate dicts with "node_id", "node_name", "node_labels", "similarity".
+            metadata (dict): Optional context including:
+                - context_nodes: iterable of related node names from the utterance
+                - candidate_neighbors: dict mapping node_id -> iterable of neighbor names
+                - profile_comparisons: dict mapping node_id -> comparison result ("match"/"contradict")
+                - tie_delta: float threshold for logging near-ties
+
+        Returns:
+            dict with keys: candidate (best match or None), score (float), tie (bool), scores (list of per-candidate scores)
+        """
+        if not candidates:
+            return {"candidate": None, "score": 0.0, "tie": False, "scores": []}
+
+        metadata = metadata or {}
+        tie_delta = metadata.get("tie_delta", self.CANDIDATE_TIE_DELTA)
+        profile_comparisons = metadata.get("profile_comparisons") or {}
+
+        def _normalize_nodes(raw_nodes, default_label=None):
+            normalized = []
+            for entry in raw_nodes or []:
+                if entry is None:
+                    continue
+                if isinstance(entry, dict):
+                    name = entry.get("name") or entry.get("target_name")
+                    labels = entry.get("labels") or entry.get("label")
+                    if not labels:
+                        labels = entry.get("target_label") or entry.get("target_type")
+                    embedding = entry.get("embedding") or entry.get("target_embedding")
+                    descriptor = entry.get("descriptor")
+                else:
+                    name = str(entry)
+                    labels = default_label
+                    embedding = None
+                    descriptor = None
+                labels_list = []
+                if isinstance(labels, (list, tuple, set)):
+                    labels_list = [str(label).lower() for label in labels if label]
+                elif labels:
+                    labels_list = [str(labels).lower()]
+                primary_label = labels_list[0] if labels_list else (default_label or "unknown")
+                normalized.append(
+                    {
+                        "name": name,
+                        "name_normalized": (name or "").lower(),
+                        "labels": labels_list,
+                        "primary_label": (primary_label or "unknown").lower(),
+                        "embedding": embedding,
+                        "descriptor": descriptor,
+                    }
+                )
+            return normalized
+
+        def _group_by_label(nodes):
+            grouped = {}
+            for node in nodes:
+                label = node.get("primary_label") or "unknown"
+                grouped.setdefault(label, []).append(node)
+            return grouped
+
+        def _resolve_embedding(node_entry):
+            embedding = node_entry.get("embedding")
+            if embedding:
+                return embedding
+            descriptor = node_entry.get("descriptor") or {}
+            return descriptor.get("embedding")
+
+        def _bucket_overlap(context_nodes, neighbor_nodes):
+            match_count = 0
+            best_similarity = 0.0
+            for ctx in context_nodes:
+                ctx_embedding = ctx.get("embedding")
+                if not ctx_embedding:
+                    continue
+                for neighbor in neighbor_nodes:
+                    neighbor_embedding = _resolve_embedding(neighbor)
+                    if not neighbor_embedding:
+                        continue
+                    similarity = self._cosine_similarity(ctx_embedding, neighbor_embedding)
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                    if similarity >= self.CONTEXT_MATCH_THRESHOLD:
+                        match_count += 1
+            return match_count, best_similarity
+
+        context_nodes = _normalize_nodes(
+            metadata.get("context_nodes"),
+            default_label=(entity_record.get("type") or "unknown").lower(),
+        )
+        context_buckets = _group_by_label(context_nodes)
+        effective_context_labels = {
+            label
+            for label, nodes in context_buckets.items()
+            if any(node.get("embedding") for node in nodes)
+        }
+        context_bucket_count = len(effective_context_labels)
+
+        candidate_neighbor_buckets = {}
+        for node_id, neighbor_entries in (metadata.get("candidate_neighbors") or {}).items():
+            normalized_neighbors = _normalize_nodes(neighbor_entries)
+            candidate_neighbor_buckets[node_id] = _group_by_label(normalized_neighbors)
+
+        entity_name = (entity_record.get("name") or "").lower()
+        entity_type = (entity_record.get("type") or "unknown").lower()
+
+        scored_entries = []
+        for candidate in candidates:
+            similarity = candidate.get("similarity") or 0.0
+            score = similarity
+            candidate_name = (candidate.get("node_name") or "").lower()
+            if candidate_name == entity_name:
+                score += 0.05
+
+            candidate_labels = [
+                label.lower() for label in (candidate.get("node_labels") or []) if label
+            ]
+            if entity_type and entity_type in candidate_labels:
+                score += 0.03
+
+            overlap_labels = set()
+            missing_labels = set()
+            penalty_log = []
+            neighbor_buckets = candidate_neighbor_buckets.get(
+                candidate.get("node_id"), {}
+            )
+
+            for label in effective_context_labels:
+                label_context_nodes = context_buckets.get(label, [])
+                label_neighbor_nodes = neighbor_buckets.get(label, [])
+                match_count, _ = _bucket_overlap(
+                    label_context_nodes,
+                    label_neighbor_nodes,
+                )
+                if match_count > 0:
+                    overlap_labels.add(label)
+                    bucket_bonus = min(0.12, self.CONTEXT_MATCH_BONUS * match_count)
+                    score += bucket_bonus
+                else:
+                    missing_labels.add(label)
+                    penalty = self.CONTEXT_BUCKET_PENALTY
+                    score -= penalty
+                    penalty_log.append(
+                        {
+                            "label": label,
+                            "penalty": penalty,
+                            "reason": "no_overlap",
+                        }
+                    )
+                    logger.info(
+                        "[context_mismatch] entity=%s candidate=%s label=%s penalty=%.3f",
+                        entity_record.get("name"),
+                        candidate.get("node_name"),
+                        label,
+                        penalty,
+                    )
+
+            profile_result = profile_comparisons.get(candidate.get("node_id"))
+            if profile_result == "match":
+                score += 0.15
+            elif profile_result == "contradict":
+                score -= self.PROFILE_CONTRADICTION_PENALTY
+                penalty_log.append(
+                    {
+                        "type": "profile_contradiction",
+                        "penalty": self.PROFILE_CONTRADICTION_PENALTY,
+                    }
+                )
+                logger.info(
+                    "[candidate_penalized] entity=%s candidate=%s reason=profile_contradiction penalty=%.3f",
+                    entity_record.get("name"),
+                    candidate.get("node_name"),
+                    self.PROFILE_CONTRADICTION_PENALTY,
+                )
+
+            if context_bucket_count and not overlap_labels:
+                prior_score = score
+                score *= self.NO_CONTEXT_OVERLAP_SCALE
+                penalty_log.append(
+                    {
+                        "type": "no_context_overlap",
+                        "scale": self.NO_CONTEXT_OVERLAP_SCALE,
+                        "before": round(prior_score, 4),
+                        "after": round(score, 4),
+                    }
+                )
+                logger.info(
+                    "[candidate_penalized] entity=%s candidate=%s reason=no_context_overlap before=%.4f after=%.4f",
+                    entity_record.get("name"),
+                    candidate.get("node_name"),
+                    prior_score,
+                    score,
+                )
+
+            scored_entries.append(
+                (
+                    score,
+                    candidate,
+                    {
+                        "node_id": candidate.get("node_id"),
+                        "name": candidate.get("node_name"),
+                        "score": round(score, 4),
+                        "similarity": round(similarity, 4),
+                        "overlap_labels": sorted(overlap_labels),
+                        "missing_labels": sorted(missing_labels),
+                        "penalties": [dict(p) for p in penalty_log],
+                        "penalties_applied": bool(penalty_log),
+                        "profile_result": profile_result,
+                    },
+                )
+            )
+
+        scored_entries.sort(key=lambda item: item[0], reverse=True)
+        best_score, best_candidate, best_details = scored_entries[0]
+        tie = False
+        if len(scored_entries) > 1:
+            second_score = scored_entries[1][0]
+            delta = abs(best_score - second_score)
+            if delta <= tie_delta:
+                tie = True
+                logger.info(
+                    "[candidate_tie] entity=%s score1=%.4f score2=%.4f delta=%.4f",
+                    entity_record.get("name"),
+                    best_score,
+                    second_score,
+                    delta,
+                )
+
+        return {
+            "candidate": best_candidate,
+            "score": best_score,
+            "tie": tie,
+            "scores": [entry for _, _, entry in scored_entries],
+            "overlap_labels": best_details.get("overlap_labels", []),
+            "penalties_applied": best_details.get("penalties_applied", False),
+            "context_bucket_count": context_bucket_count,
+        }
+
+    def _get_candidate_neighbor_names(self, candidate_ids, user_id):
+        """
+        Fetch neighbor names for candidate nodes to provide relationship context for scoring.
+        """
+        if not candidate_ids:
+            return {}
+
+        cypher = """
+        UNWIND $candidate_ids AS candidate_id
+        MATCH (n)
+        WHERE elementId(n) = candidate_id AND n.user_id = $user_id
+        OPTIONAL MATCH (n)-[r]-(neighbor {user_id: $user_id})
+        WITH candidate_id, collect(DISTINCT neighbor)[..$neighbor_limit] AS neighbors
+        RETURN candidate_id AS node_id,
+               [neighbor IN neighbors WHERE neighbor IS NOT NULL |
+                    {
+                        name: neighbor.name,
+                        labels: labels(neighbor),
+                        embedding: neighbor.embedding,
+                        descriptor: head([
+                            (neighbor)-[descriptor_rel]-(descriptor {user_id: $user_id})
+                            WHERE descriptor.embedding IS NOT NULL
+                              AND NOT 'person' IN labels(descriptor)
+                              AND descriptor <> neighbor
+                            | {
+                                name: descriptor.name,
+                                labels: labels(descriptor),
+                                embedding: descriptor.embedding,
+                                relationship: toLower(type(descriptor_rel))
+                            }
+                        ])
+                    }
+               ] AS neighbor_details
+        """
+        params = {
+            "candidate_ids": candidate_ids,
+            "user_id": user_id,
+            "neighbor_limit": self.CANDIDATE_NEIGHBOR_LIMIT,
+        }
+        records = self.graph.query(cypher, params=params)
+        neighbor_map = {}
+        for record in records:
+            node_id = record.get("node_id")
+            neighbor_details = []
+            for neighbor in record.get("neighbor_details") or []:
+                descriptor = neighbor.get("descriptor")
+                descriptor_info = None
+                if descriptor:
+                    descriptor_info = {
+                        "name": descriptor.get("name"),
+                        "labels": [
+                            str(label).lower()
+                            for label in (descriptor.get("labels") or [])
+                            if label
+                        ],
+                        "embedding": descriptor.get("embedding"),
+                        "relationship": descriptor.get("relationship"),
+                    }
+                neighbor_details.append(
+                    {
+                        "name": neighbor.get("name"),
+                        "labels": [
+                            str(label).lower()
+                            for label in (neighbor.get("labels") or [])
+                            if label
+                        ],
+                        "embedding": neighbor.get("embedding"),
+                        "descriptor": descriptor_info,
+                    }
+                )
+            neighbor_map[node_id] = neighbor_details
+        return neighbor_map
+
     def _remove_spaces_from_entities(self, entity_list):
         """
         Process entities by:
@@ -1477,8 +2102,6 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         3. Filter out any literal pronoun nodes that slipped through
         """
         # Pronouns that should never become nodes
-        PRONOUN_BLACKLIST = {'me', 'my', 'myself', 'he', 'she', 'they', 'him', 'her', 'them', 'his', 'hers', 'their', 'theirs'}
-        
         filtered_entities = []
         for item in entity_list:
             item["source"] = item["source"].lower().replace(" ", "_")
@@ -1520,70 +2143,122 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
 
         return filtered_entities
 
-    def _search_source_node(self, source_embedding, user_id, threshold=0.9):
-        cypher = """
-            MATCH (source_candidate)
-            WHERE source_candidate.embedding IS NOT NULL 
-            AND source_candidate.user_id = $user_id
+    def _search_source_node(self, source_embedding, user_id, label=None, limit=None):
+        return self._search_node_candidates(
+            embedding=source_embedding,
+            user_id=user_id,
+            label=label,
+            candidate_alias="source_candidate",
+            limit=limit,
+        )
 
-            WITH source_candidate,
-                round(
-                    reduce(dot = 0.0, i IN range(0, size(source_candidate.embedding)-1) |
-                        dot + source_candidate.embedding[i] * $source_embedding[i]) /
-                    (sqrt(reduce(l2 = 0.0, i IN range(0, size(source_candidate.embedding)-1) |
-                        l2 + source_candidate.embedding[i] * source_candidate.embedding[i])) *
-                    sqrt(reduce(l2 = 0.0, i IN range(0, size($source_embedding)-1) |
-                        l2 + $source_embedding[i] * $source_embedding[i])))
-                , 4) AS source_similarity
-            WHERE source_similarity >= $threshold
+    def _search_destination_node(self, destination_embedding, user_id, label=None, limit=None):
+        return self._search_node_candidates(
+            embedding=destination_embedding,
+            user_id=user_id,
+            label=label,
+            candidate_alias="destination_candidate",
+            limit=limit,
+        )
 
-            WITH source_candidate, source_similarity
-            ORDER BY source_similarity DESC
-            LIMIT 1
+    def _search_node_candidates(self, embedding, user_id, label, candidate_alias, limit=None):
+        """
+        Run a label-aware cosine similarity search for potential node re-use.
+        """
+        limit = limit or self.NODE_SEARCH_CANDIDATE_LIMIT
+        label_filter = label.lower() if isinstance(label, str) else None
+        if label_filter in (None, "", "unknown"):
+            label_filter = None
 
-            RETURN elementId(source_candidate)
-            """
+        candidates = []
+        label_threshold = self._get_label_threshold(label_filter)
+        if label_filter:
+            candidates = self._run_node_similarity_query(
+                embedding=embedding,
+                user_id=user_id,
+                threshold=label_threshold,
+                label_filter=label_filter,
+                require_label_match=True,
+                candidate_alias=candidate_alias,
+                limit=limit,
+            )
+            if not candidates:
+                logger.info(
+                    "[node_label_fallback] alias=%s label=%s threshold=%.3f",
+                    candidate_alias,
+                    label_filter,
+                    label_threshold,
+                )
 
+        if not candidates:
+            candidates = self._run_node_similarity_query(
+                embedding=embedding,
+                user_id=user_id,
+                threshold=self._get_label_threshold("default"),
+                label_filter=None,
+                require_label_match=False,
+                candidate_alias=candidate_alias,
+                limit=limit,
+            )
+        return candidates
+
+    def _run_node_similarity_query(
+        self,
+        embedding,
+        user_id,
+        threshold,
+        label_filter,
+        require_label_match,
+        candidate_alias,
+        limit,
+    ):
+        cypher = f"""
+            MATCH ({candidate_alias})
+            WHERE {candidate_alias}.embedding IS NOT NULL 
+              AND {candidate_alias}.user_id = $user_id
+            WITH {candidate_alias}, [label IN labels({candidate_alias}) | toLower(label)] AS node_labels,
+                 round(
+                    reduce(dot = 0.0, i IN range(0, size({candidate_alias}.embedding)-1) |
+                        dot + {candidate_alias}.embedding[i] * $node_embedding[i]) /
+                    (sqrt(reduce(l2 = 0.0, i IN range(0, size({candidate_alias}.embedding)-1) |
+                        l2 + {candidate_alias}.embedding[i] * {candidate_alias}.embedding[i])) *
+                    sqrt(reduce(l2 = 0.0, i IN range(0, size($node_embedding)-1) |
+                        l2 + $node_embedding[i] * $node_embedding[i])))
+                , 4) AS similarity
+            WHERE similarity >= $threshold
+              AND (
+                $require_label_match = false OR (
+                    $label_filter IS NOT NULL AND $label_filter IN node_labels
+                )
+              )
+            WITH {candidate_alias}, node_labels, similarity
+            ORDER BY similarity DESC
+            LIMIT $limit
+            RETURN elementId({candidate_alias}) AS node_id,
+                   {candidate_alias}.name AS node_name,
+                   node_labels AS node_labels,
+                   {candidate_alias}.person_uid AS person_uid,
+                   similarity
+        """
         params = {
-            "source_embedding": source_embedding,
+            "node_embedding": embedding,
             "user_id": user_id,
             "threshold": threshold,
+            "label_filter": label_filter,
+            "require_label_match": require_label_match,
+            "limit": limit,
         }
-
-        result = self.graph.query(cypher, params=params)
-        return result
-
-    def _search_destination_node(self, destination_embedding, user_id, threshold=0.9):
-        cypher = """
-            MATCH (destination_candidate)
-            WHERE destination_candidate.embedding IS NOT NULL 
-            AND destination_candidate.user_id = $user_id
-
-            WITH destination_candidate,
-                round(
-                    reduce(dot = 0.0, i IN range(0, size(destination_candidate.embedding)-1) |
-                        dot + destination_candidate.embedding[i] * $destination_embedding[i]) /
-                    (sqrt(reduce(l2 = 0.0, i IN range(0, size(destination_candidate.embedding)-1) |
-                        l2 + destination_candidate.embedding[i] * destination_candidate.embedding[i])) *
-                    sqrt(reduce(l2 = 0.0, i IN range(0, size($destination_embedding)-1) |
-                        l2 + $destination_embedding[i] * $destination_embedding[i])))
-                , 4) AS destination_similarity
-            WHERE destination_similarity >= $threshold
-
-            WITH destination_candidate, destination_similarity
-            ORDER BY destination_similarity DESC
-            LIMIT 1
-
-            RETURN elementId(destination_candidate)
-            """
-        params = {
-            "destination_embedding": destination_embedding,
-            "user_id": user_id,
-            "threshold": threshold,
-        }
-
-        result = self.graph.query(cypher, params=params)
-        return result
+        records = self.graph.query(cypher, params=params)
+        return [
+            {
+                "node_id": record.get("node_id"),
+                "node_name": record.get("node_name"),
+                "node_labels": record.get("node_labels") or [],
+                "person_uid": record.get("person_uid"),
+                "similarity": record.get("similarity") or 0.0,
+            }
+            for record in records
+        ]
 
     def update_relationship(
         self, source, relationship, destination, user_id, **properties
