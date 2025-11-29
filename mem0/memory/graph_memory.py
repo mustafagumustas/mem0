@@ -1172,165 +1172,227 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                         person_name,
                     )
             else:
-                person_embedding = _get_embedding(person_name)
-                person_candidates = self._search_source_node(
-                    person_embedding,
-                    user_id,
-                    label="person",
-                    limit=self.NODE_SEARCH_CANDIDATE_LIMIT,
-                )
+                existing_count = self._count_person_nodes(person_name, user_id)
 
-                profile_comparisons = {}
-                for profile in existing_profiles_for_name:
-                    element_id = profile.get("element_id")
-                    if not element_id:
-                        continue
-                    profile_comparisons[element_id] = self._compare_person_profiles(
-                        profile, new_profile
-                    )
-
-                candidate_neighbor_map = self._get_candidate_neighbor_names(
-                    [candidate["node_id"] for candidate in person_candidates],
-                    user_id,
-                )
-
-                scoring_result = self._score_entity_candidates(
-                    {"name": person_name, "type": "person"},
-                    person_candidates,
-                    metadata={
-                        "context_nodes": context_nodes,
-                        "candidate_neighbors": candidate_neighbor_map,
-                        "profile_comparisons": profile_comparisons,
-                        "tie_delta": 0.04,
-                    },
-                )
-                best_candidate = scoring_result.get("candidate")
-                best_score = scoring_result.get("score", 0.0)
-                tie = scoring_result.get("tie", False)
-                overlap_labels = scoring_result.get("overlap_labels") or []
-                penalties_applied = scoring_result.get("penalties_applied", False)
-                context_bucket_count = scoring_result.get("context_bucket_count", 0)
-                score_entries = scoring_result.get("scores", [])
-                best_details = score_entries[0] if score_entries else {}
-                base_similarity = best_details.get("similarity", 0.0)
-                penalty_reasons = set()
-                for penalty in best_details.get("penalties", []):
-                    reason = penalty.get("reason") or penalty.get("type")
-                    if reason:
-                        penalty_reasons.add(reason)
-                context_penalty_reasons = {"no_overlap", "no_context_overlap"}
-                context_penalties_only = (
-                    not penalty_reasons
-                    or penalty_reasons.issubset(context_penalty_reasons)
-                )
-                matched_profile = None
-                if best_candidate:
-                    matched_profile = next(
-                        (
-                            profile
-                            for profile in existing_profiles_for_name
-                            if profile.get("element_id") == best_candidate.get("node_id")
-                        ),
-                        None,
-                    )
-                profile_result = None
-                if best_candidate:
-                    profile_result = profile_comparisons.get(
-                        best_candidate.get("node_id")
-                    )
-
-                person_threshold = self._get_label_threshold("person")
-                has_context_overlap = bool(overlap_labels)
-                allow_reuse = has_context_overlap or profile_result == "match"
-                near_threshold = (
-                    best_candidate
-                    and best_score >= person_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA
-                )
-                penalties_triggered = penalties_applied or (
-                    context_bucket_count > 0 and not has_context_overlap
-                )
-                existing_count = len(existing_profiles_for_name)
-                single_existing_profile = existing_count == 1
-                allow_reuse_without_overlap = (
-                    best_candidate
-                    and not allow_reuse
-                    and not has_context_overlap
-                    and single_existing_profile
-                    and matched_profile is not None
-                    and profile_result != "contradict"
-                    and context_penalties_only
-                    and (
-                        best_score >= person_threshold
-                        or base_similarity >= person_threshold
-                    )
-                )
-                if tie:
-                    decision = {
-                        "decision": "ambiguous",
-                        "element_id": None,
-                        "person_uid": None,
-                        "matched_profile": None,
-                        "all_comparisons": scoring_result.get("scores", []),
-                        "candidates": person_candidates,
-                    }
-                elif best_candidate and best_score >= person_threshold and allow_reuse:
-                    decision = {
-                        "decision": "reuse",
-                        "element_id": best_candidate.get("node_id"),
-                        "person_uid": best_candidate.get("person_uid"),
-                        "matched_profile": matched_profile,
-                        "all_comparisons": scoring_result.get("scores", []),
-                    }
-                elif best_candidate and allow_reuse_without_overlap:
-                    logger.info(
-                        "[person_reuse_fallback] name=%s reason=single_profile_no_overlap",
-                        person_name,
-                    )
-                    decision = {
-                        "decision": "reuse",
-                        "element_id": best_candidate.get("node_id"),
-                        "person_uid": best_candidate.get("person_uid"),
-                        "matched_profile": matched_profile,
-                        "all_comparisons": scoring_result.get("scores", []),
-                    }
-                elif best_candidate and best_score >= person_threshold and not allow_reuse:
-                    decision = {
-                        "decision": "unconfirmed",
-                        "element_id": None,
-                        "person_uid": None,
-                        "matched_profile": None,
-                        "all_comparisons": scoring_result.get("scores", []),
-                        "existing_count": existing_count,
-                        "candidates": person_candidates,
-                    }
-                elif best_candidate and near_threshold and penalties_triggered:
-                    decision = {
-                        "decision": "unconfirmed",
-                        "element_id": None,
-                        "person_uid": None,
-                        "matched_profile": None,
-                        "all_comparisons": scoring_result.get("scores", []),
-                        "existing_count": existing_count,
-                        "candidates": person_candidates,
-                    }
-                elif best_candidate or existing_profiles_for_name:
-                    decision = {
-                        "decision": "unconfirmed",
-                        "element_id": None,
-                        "person_uid": None,
-                        "matched_profile": None,
-                        "all_comparisons": scoring_result.get("scores", []),
-                        "existing_count": existing_count,
-                        "candidates": person_candidates,
-                    }
-                else:
+                if existing_count == 0:
+                    # No node with this name – create new without heavy disambiguation
                     decision = {
                         "decision": "new",
                         "element_id": None,
                         "person_uid": None,
                         "matched_profile": None,
-                        "all_comparisons": scoring_result.get("scores", []),
+                        "all_comparisons": [],
                     }
+                elif existing_count == 1:
+                    # Exactly one existing node – compare profiles to decide reuse vs new
+                    base_profile = None
+                    if len(existing_profiles_for_name) == 1:
+                        base_profile = existing_profiles_for_name[0]
+                    if base_profile is None:
+                        base_profile = self._fetch_single_person_profile(
+                            person_name, user_id
+                        )
+                        if base_profile:
+                            existing_profiles_for_name = [base_profile]
+
+                    comparison_result = None
+                    comparisons = []
+                    if base_profile:
+                        comparison_result = self._compare_person_profiles(
+                            base_profile, new_profile
+                        )
+                        comparisons.append((base_profile, comparison_result))
+
+                    if comparison_result == "match":
+                        decision = {
+                            "decision": "reuse",
+                            "element_id": base_profile.get("element_id") if base_profile else None,
+                            "person_uid": base_profile.get("person_uid") if base_profile else None,
+                            "matched_profile": base_profile,
+                            "all_comparisons": comparisons,
+                        }
+                    elif comparison_result == "contradict":
+                        decision = {
+                            "decision": "new",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": comparisons,
+                        }
+                    else:
+                        # No overlap or no profile info – create a new person to avoid wrong reuse
+                        decision = {
+                            "decision": "new",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": comparisons,
+                        }
+                        logger.info(
+                            "[person_new_no_overlap] name=%s reason=%s",
+                            person_name,
+                            comparison_result or "no_profile",
+                        )
+                else:
+                    # existing_count >= 2, run full disambiguation
+                    person_embedding = _get_embedding(person_name)
+                    person_candidates = self._search_source_node(
+                        person_embedding,
+                        user_id,
+                        label="person",
+                        limit=self.NODE_SEARCH_CANDIDATE_LIMIT,
+                    )
+
+                    profile_comparisons = {}
+                    for profile in existing_profiles_for_name:
+                        element_id = profile.get("element_id")
+                        if not element_id:
+                            continue
+                        profile_comparisons[element_id] = self._compare_person_profiles(
+                            profile, new_profile
+                        )
+
+                    candidate_neighbor_map = self._get_candidate_neighbor_names(
+                        [candidate["node_id"] for candidate in person_candidates],
+                        user_id,
+                    )
+
+                    scoring_result = self._score_entity_candidates(
+                        {"name": person_name, "type": "person"},
+                        person_candidates,
+                        metadata={
+                            "context_nodes": context_nodes,
+                            "candidate_neighbors": candidate_neighbor_map,
+                            "profile_comparisons": profile_comparisons,
+                            "tie_delta": 0.04,
+                        },
+                    )
+                    best_candidate = scoring_result.get("candidate")
+                    best_score = scoring_result.get("score", 0.0)
+                    tie = scoring_result.get("tie", False)
+                    overlap_labels = scoring_result.get("overlap_labels") or []
+                    penalties_applied = scoring_result.get("penalties_applied", False)
+                    context_bucket_count = scoring_result.get("context_bucket_count", 0)
+                    score_entries = scoring_result.get("scores", [])
+                    best_details = score_entries[0] if score_entries else {}
+                    base_similarity = best_details.get("similarity", 0.0)
+                    penalty_reasons = set()
+                    for penalty in best_details.get("penalties", []):
+                        reason = penalty.get("reason") or penalty.get("type")
+                        if reason:
+                            penalty_reasons.add(reason)
+                    context_penalty_reasons = {"no_overlap", "no_context_overlap"}
+                    context_penalties_only = (
+                        not penalty_reasons
+                        or penalty_reasons.issubset(context_penalty_reasons)
+                    )
+                    matched_profile = None
+                    if best_candidate:
+                        matched_profile = next(
+                            (
+                                profile
+                                for profile in existing_profiles_for_name
+                                if profile.get("element_id") == best_candidate.get("node_id")
+                            ),
+                            None,
+                        )
+                    profile_result = None
+                    if best_candidate:
+                        profile_result = profile_comparisons.get(
+                            best_candidate.get("node_id")
+                        )
+
+                    person_threshold = self._get_label_threshold("person")
+                    has_context_overlap = bool(overlap_labels)
+                    allow_reuse = has_context_overlap or profile_result == "match"
+                    near_threshold = (
+                        best_candidate
+                        and best_score >= person_threshold - self.HIGH_SIM_NEAR_THRESHOLD_DELTA
+                    )
+                    penalties_triggered = penalties_applied or (
+                        context_bucket_count > 0 and not has_context_overlap
+                    )
+                    single_existing_profile = len(existing_profiles_for_name) == 1
+                    allow_reuse_without_overlap = (
+                        best_candidate
+                        and not allow_reuse
+                        and not has_context_overlap
+                        and single_existing_profile
+                        and matched_profile is not None
+                        and profile_result != "contradict"
+                        and context_penalties_only
+                        and (
+                            best_score >= person_threshold
+                            or base_similarity >= person_threshold
+                        )
+                    )
+                    if tie:
+                        decision = {
+                            "decision": "ambiguous",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": scoring_result.get("scores", []),
+                            "candidates": person_candidates,
+                        }
+                    elif best_candidate and best_score >= person_threshold and allow_reuse:
+                        decision = {
+                            "decision": "reuse",
+                            "element_id": best_candidate.get("node_id"),
+                            "person_uid": best_candidate.get("person_uid"),
+                            "matched_profile": matched_profile,
+                            "all_comparisons": scoring_result.get("scores", []),
+                        }
+                    elif best_candidate and allow_reuse_without_overlap:
+                        logger.info(
+                            "[person_reuse_fallback] name=%s reason=single_profile_no_overlap",
+                            person_name,
+                        )
+                        decision = {
+                            "decision": "reuse",
+                            "element_id": best_candidate.get("node_id"),
+                            "person_uid": best_candidate.get("person_uid"),
+                            "matched_profile": matched_profile,
+                            "all_comparisons": scoring_result.get("scores", []),
+                        }
+                    elif best_candidate and best_score >= person_threshold and not allow_reuse:
+                        decision = {
+                            "decision": "unconfirmed",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": scoring_result.get("scores", []),
+                            "existing_count": existing_count,
+                            "candidates": person_candidates,
+                        }
+                    elif best_candidate and near_threshold and penalties_triggered:
+                        decision = {
+                            "decision": "unconfirmed",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": scoring_result.get("scores", []),
+                            "existing_count": existing_count,
+                            "candidates": person_candidates,
+                        }
+                    elif best_candidate or existing_profiles_for_name:
+                        decision = {
+                            "decision": "unconfirmed",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": scoring_result.get("scores", []),
+                            "existing_count": existing_count,
+                            "candidates": person_candidates,
+                        }
+                    else:
+                        decision = {
+                            "decision": "new",
+                            "element_id": None,
+                            "person_uid": None,
+                            "matched_profile": None,
+                            "all_comparisons": scoring_result.get("scores", []),
+                        }
             
             person_decisions[person_name] = decision
             
@@ -1875,6 +1937,94 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         if records:
             return records[0].get("person_uid")
         return None
+
+    def _count_person_nodes(self, person_name, user_id):
+        """
+        Count how many person nodes exist for a given name and user.
+        """
+        if not person_name or not user_id:
+            return 0
+
+        query = """
+        MATCH (p:person {name: $person_name, user_id: $user_id})
+        RETURN count(p) AS person_count
+        """
+        params = {"person_name": person_name, "user_id": user_id}
+        try:
+            records = self.graph.query(query, params=params)
+            if records:
+                return records[0].get("person_count", 0) or 0
+        except Exception as exc:
+            logger.exception(
+                "Failed to count person nodes for '%s': %s", person_name, exc
+            )
+        return 0
+
+    def _fetch_single_person_profile(self, person_name, user_id):
+        """
+        Fetch a single person's profile (elementId, person_uid, name, facts) by exact name.
+
+        Returns:
+            dict or None: Profile matching _build_person_profiles format, or None if not found.
+        """
+        if not person_name or not user_id:
+            return None
+
+        query = """
+        MATCH (p:person {name: $person_name, user_id: $user_id})
+        WITH p, elementId(p) AS pid, p.person_uid AS person_uid
+        OPTIONAL MATCH (p)-[r]->(m {user_id: $user_id})
+        WITH p, pid, person_uid, collect({
+            direction: 'out',
+            relationship: type(r),
+            target_name: m.name,
+            target_uid: m.person_uid,
+            target_type: coalesce(head([lab IN labels(m) WHERE lab <> 'person']), head(labels(m))),
+            metadata: {
+                weight: r.weight,
+                is_uncertain: r.is_uncertain,
+                status: r.status,
+                emotion: r.emotion,
+                start_date: r.start_date,
+                end_date: r.end_date
+            }
+        }) AS outgoing
+        OPTIONAL MATCH (m2 {user_id: $user_id})-[r2]->(p)
+        WITH p, pid, person_uid, outgoing, collect({
+            direction: 'in',
+            relationship: type(r2),
+            target_name: m2.name,
+            target_uid: m2.person_uid,
+            target_type: coalesce(head([lab IN labels(m2) WHERE lab <> 'person']), head(labels(m2))),
+            metadata: {
+                weight: r2.weight,
+                is_uncertain: r2.is_uncertain,
+                status: r2.status,
+                emotion: r2.emotion,
+                start_date: r2.start_date,
+                end_date: r2.end_date
+            }
+        }) AS incoming
+        RETURN pid AS element_id, person_uid, p.name AS name, outgoing + incoming AS facts
+        LIMIT 1
+        """
+        params = {"person_name": person_name, "user_id": user_id}
+        try:
+            records = self.graph.query(query, params=params)
+            if not records:
+                return None
+            row = records[0]
+            return {
+                "person_uid": row.get("person_uid"),
+                "element_id": row.get("element_id"),
+                "name": row.get("name"),
+                "facts": row.get("facts") or [],
+            }
+        except Exception as exc:
+            logger.exception(
+                "Failed to fetch person profile for '%s': %s", person_name, exc
+            )
+            return None
 
     def _score_entity_candidates(self, entity_record, candidates, metadata=None):
         """
