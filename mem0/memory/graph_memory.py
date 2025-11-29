@@ -7,13 +7,14 @@ import threading
 from concurrent.futures import ThreadPoolExecutor
 import uuid
 import math
+from time import perf_counter
 
 try:
     import numpy as _np
 except ImportError:  # pragma: no cover - optional performance boost
     _np = None
 
-from mem0.memory.utils import format_entities
+from mem0.memory.utils import format_entities, format_timing_summary, log_duration, time_block
 
 
 class PersonDisambiguationException(Exception):
@@ -322,46 +323,114 @@ Return updated weight, emotion, status, and analysis flags."""
                 except UnconfirmedPersonException as e:
                     # Ask user: "Is this a new person named {e.person_name}?"
         """
-        # Step 1: Retrieve nodes from data
-        entity_type_map = self._retrieve_nodes_from_data(data, filters)
-        node_names = list(entity_type_map.keys())
-        node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
-        
-        # Step 2: Establish relations from data
-        to_be_added = self._establish_nodes_relations_from_data(
-            data, filters, entity_type_map
-        )
-        
-        # Step 3: Search graph database
-        search_output = self._search_graph_db(
-            node_list=node_names, node_labels=node_labels, filters=filters
-        )
-        
-        # Step 4: Analyze and update existing relations
-        # NOTE: Weight adjustment is now done during search operations, not during add
-        # This makes add operations faster and analyzes weights based on actual usage
-        # evolution_updates = self.analyze_and_update_existing_relations(search_output, data, filters)
-        evolution_updates = []  # Disabled - now handled in search
-        
-        # Step 5: Get delete entities from search output
-        to_be_updated = self._get_delete_entities_from_search_output(
-            search_output, data, filters
-        )
+        start_total = perf_counter()
+        node_names = []
+        timings = {}
+        try:
+            # Step 1: Retrieve nodes from data
+            with time_block(
+                logger,
+                "graph.add.extract_entities",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+            ):
+                entity_type_map = self._retrieve_nodes_from_data(data, filters, timings)
+            node_names = list(entity_type_map.keys())
+            node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
+            
+            # Step 2: Establish relations from data
+            with time_block(
+                logger,
+                "graph.add.establish_relations",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                nodes=len(node_names),
+            ):
+                to_be_added = self._establish_nodes_relations_from_data(
+                    data, filters, entity_type_map, timings
+                )
+            
+            # Step 3: Search graph database
+            with time_block(
+                logger,
+                "graph.add.search_graph",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                nodes=len(node_names),
+            ):
+                search_output = self._search_graph_db(
+                    node_list=node_names, node_labels=node_labels, filters=filters, emit_log=False
+                )
+            
+            # Step 4: Analyze and update existing relations
+            # NOTE: Weight adjustment is now done during search operations, not during add
+            # This makes add operations faster and analyzes weights based on actual usage
+            # evolution_updates = self.analyze_and_update_existing_relations(search_output, data, filters)
+            evolution_updates = []  # Disabled - now handled in search
+            
+            # Step 5: Get delete entities from search output
+            with time_block(
+                logger,
+                "graph.add.delete_detection",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                relations=len(search_output),
+            ):
+                to_be_updated = self._get_delete_entities_from_search_output(
+                    search_output, data, filters, timings
+                )
 
-        # TODO: Batch queries with APOC plugin
-        # TODO: Add more filter support
-        
-        # Step 6: Process relationship updates
-        updated_entities = self._process_relationship_updates(to_be_updated, filters["user_id"])
-        
-        updated_entities.extend(evolution_updates)
-        
-        # Step 7: Add entities (pass search_output for person profile matching)
-        added_entities = self._add_entities(
-            to_be_added, filters["user_id"], entity_type_map, search_output
-        )
+            # TODO: Batch queries with APOC plugin
+            # TODO: Add more filter support
+            
+            # Step 6: Process relationship updates
+            with time_block(
+                logger,
+                "graph.add.process_updates",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                updates=len(to_be_updated),
+            ):
+                updated_entities = self._process_relationship_updates(to_be_updated, filters["user_id"])
+            
+            updated_entities.extend(evolution_updates)
+            
+            # Step 7: Add entities (pass search_output for person profile matching)
+            with time_block(
+                logger,
+                "graph.add.add_entities",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                to_add=len(to_be_added),
+            ):
+                added_entities = self._add_entities(
+                    to_be_added, filters["user_id"], entity_type_map, search_output
+                )
 
-        return {"updated_entities": updated_entities, "added_entities": added_entities}
+            return {"updated_entities": updated_entities, "added_entities": added_entities}
+        finally:
+            timings["total"] = perf_counter() - start_total
+            logger.info(
+                format_timing_summary(
+                    "graph.add",
+                    timings,
+                    order=[
+                        "total",
+                        "graph.add.extract_entities",
+                        "graph.add.establish_relations",
+                        "graph.add.search_graph",
+                        "graph.add.delete_detection",
+                        "graph.add.process_updates",
+                        "graph.add.add_entities",
+                    ],
+                )
+            )
 
     def _background_weight_adjustment(self, search_results, query, filters):
         """
@@ -416,102 +485,144 @@ Return updated weight, emotion, status, and analysis flags."""
                 - "contexts": List of search results from the base data store.
                 - "entities": List of related graph data based on the query.
         """
-        # Step 1: Retrieve nodes from query
-        entity_type_map = self._retrieve_nodes_from_data(query, filters)
-        node_names = list(entity_type_map.keys())
-        node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
-        
-        # Step 2: Search graph database
-        search_output = self._search_graph_db(
-            node_list=node_names, node_labels=node_labels, filters=filters
-        )
+        start_total = perf_counter()
+        node_names = []
+        timings = {}
+        try:
+            # Step 1: Retrieve nodes from query
+            with time_block(
+                logger,
+                "graph.search.extract_entities",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+            ):
+                entity_type_map = self._retrieve_nodes_from_data(query, filters, timings)
+            node_names = list(entity_type_map.keys())
+            node_labels = [entity_type_map.get(name, "unknown") for name in node_names]
+            
+            # Step 2: Search graph database
+            with time_block(
+                logger,
+                "graph.search.query_graph",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                nodes=len(node_names),
+                limit=limit,
+            ):
+                search_output = self._search_graph_db(
+                    node_list=node_names, node_labels=node_labels, filters=filters, limit=limit, emit_log=False
+                )
 
-        if not search_output:
-            return []
+            if not search_output:
+                return []
 
-        # Step 3: Prepare for BM25 ranking
-        search_outputs_sequence = [
-            [item["source"], item["relatationship"], item["destination"]]
-            for item in search_output
-        ]
-        bm25 = BM25Okapi(search_outputs_sequence)
+            # Step 3: Prepare for BM25 ranking
+            search_outputs_sequence = [
+                [item["source"], item["relatationship"], item["destination"]]
+                for item in search_output
+            ]
+            with time_block(
+                logger,
+                "graph.search.rerank",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                relations=len(search_output),
+            ):
+                bm25 = BM25Okapi(search_outputs_sequence)
 
-        tokenized_query = query.split(" ")
-        reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=15)
+                tokenized_query = query.split(" ")
+                reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=15)
 
-        # Step 4: Build final results and update metadata
-        search_results = []
-        current_time_iso = datetime.now(pytz.utc).isoformat()
-        
-        for item in reranked_results:
-            # Find the original item to retrieve all properties
-            for orig_item in search_output:
-                if (
-                    orig_item["source"] == item[0]
-                    and orig_item["relatationship"] == item[1]
-                    and orig_item["destination"] == item[2]
-                ):
+            # Step 4: Build final results and update metadata
+            search_results = []
+            current_time_iso = datetime.now(pytz.utc).isoformat()
+            
+            for item in reranked_results:
+                # Find the original item to retrieve all properties
+                for orig_item in search_output:
+                    if (
+                        orig_item["source"] == item[0]
+                        and orig_item["relatationship"] == item[1]
+                        and orig_item["destination"] == item[2]
+                    ):
 
-                    result_dict = {
-                        "source": item[0],
-                        "relationship": item[1],
-                        "destination": item[2],
-                    }
+                        result_dict = {
+                            "source": item[0],
+                            "relationship": item[1],
+                            "destination": item[2],
+                        }
 
-                    # Add person_uid if present (for person nodes)
-                    if orig_item.get("source_person_uid"):
-                        result_dict["source_person_uid"] = orig_item["source_person_uid"]
-                    if orig_item.get("destination_person_uid"):
-                        result_dict["destination_person_uid"] = orig_item["destination_person_uid"]
+                        # Add person_uid if present (for person nodes)
+                        if orig_item.get("source_person_uid"):
+                            result_dict["source_person_uid"] = orig_item["source_person_uid"]
+                        if orig_item.get("destination_person_uid"):
+                            result_dict["destination_person_uid"] = orig_item["destination_person_uid"]
 
-                    # Add optional parameters if they exist
-                    if orig_item.get("weight") is not None:
-                        result_dict["weight"] = orig_item["weight"]
-                    if orig_item.get("is_uncertain") is not None:
-                        result_dict["is_uncertain"] = orig_item["is_uncertain"]
-                    if orig_item.get("status") is not None:
-                        result_dict["status"] = orig_item["status"]
-                    if orig_item.get("start_date") is not None:
-                        result_dict["start_date"] = orig_item["start_date"]
-                    if orig_item.get("end_date") is not None:
-                        result_dict["end_date"] = orig_item["end_date"]
-                    if orig_item.get("emotion") is not None:
-                        result_dict["emotion"] = orig_item["emotion"]
-                    if orig_item.get("last_mentioned") is not None:
-                        result_dict["last_mentioned"] = orig_item["last_mentioned"]
-                    if orig_item.get("usage_count") is not None:
-                        result_dict["usage_count"] = orig_item["usage_count"]
+                        # Add optional parameters if they exist
+                        if orig_item.get("weight") is not None:
+                            result_dict["weight"] = orig_item["weight"]
+                        if orig_item.get("is_uncertain") is not None:
+                            result_dict["is_uncertain"] = orig_item["is_uncertain"]
+                        if orig_item.get("status") is not None:
+                            result_dict["status"] = orig_item["status"]
+                        if orig_item.get("start_date") is not None:
+                            result_dict["start_date"] = orig_item["start_date"]
+                        if orig_item.get("end_date") is not None:
+                            result_dict["end_date"] = orig_item["end_date"]
+                        if orig_item.get("emotion") is not None:
+                            result_dict["emotion"] = orig_item["emotion"]
+                        if orig_item.get("last_mentioned") is not None:
+                            result_dict["last_mentioned"] = orig_item["last_mentioned"]
+                        if orig_item.get("usage_count") is not None:
+                            result_dict["usage_count"] = orig_item["usage_count"]
 
-                    # Update mention metadata for this selected relationship
-                    self.update_mention_metadata(result_dict, current_time_iso, filters["user_id"])
-                    
-                    # Update mention metadata for nodes referenced in this relationship
+                        # Update mention metadata for this selected relationship
+                        self.update_mention_metadata(result_dict, current_time_iso, filters["user_id"])
+                        
+                        # Update mention metadata for nodes referenced in this relationship
+                        self.update_node_mention_metadata(item[0], current_time_iso, filters["user_id"])
+                        self.update_node_mention_metadata(item[2], current_time_iso, filters["user_id"])
+
+                        search_results.append(result_dict)
+                        break
+                else:
+                    # Fallback if original item not found
+                    fallback_result = {"source": item[0], "relationship": item[1], "destination": item[2]}
+                    # Still update metadata even for fallback case
+                    self.update_mention_metadata(fallback_result, current_time_iso, filters["user_id"])
                     self.update_node_mention_metadata(item[0], current_time_iso, filters["user_id"])
                     self.update_node_mention_metadata(item[2], current_time_iso, filters["user_id"])
+                    search_results.append(fallback_result)
 
-                    search_results.append(result_dict)
-                    break
-            else:
-                # Fallback if original item not found
-                fallback_result = {"source": item[0], "relationship": item[1], "destination": item[2]}
-                # Still update metadata even for fallback case
-                self.update_mention_metadata(fallback_result, current_time_iso, filters["user_id"])
-                self.update_node_mention_metadata(item[0], current_time_iso, filters["user_id"])
-                self.update_node_mention_metadata(item[2], current_time_iso, filters["user_id"])
-                search_results.append(fallback_result)
+            logger.info(f"Returned {len(search_results)} search results")
 
-        logger.info(f"Returned {len(search_results)} search results")
+            # Trigger weight adjustment in the background without blocking
+            # Pass the search query as context for better weight analysis
+            self._executor.submit(
+                self._background_weight_adjustment, 
+                search_results.copy(),  # Copy to avoid modification issues
+                query,  # Pass the search query as context
+                filters
+            )
 
-        # Trigger weight adjustment in the background without blocking
-        # Pass the search query as context for better weight analysis
-        self._executor.submit(
-            self._background_weight_adjustment, 
-            search_results.copy(),  # Copy to avoid modification issues
-            query,  # Pass the search query as context
-            filters
-        )
-
-        return search_results
+            return search_results
+        finally:
+            timings["total"] = perf_counter() - start_total
+            logger.info(
+                format_timing_summary(
+                    "graph.search",
+                    timings,
+                    order=[
+                        "total",
+                        "graph.search.extract_entities",
+                        "graph.search.query_graph",
+                        "graph.search.rerank",
+                    ],
+                )
+            )
 
     def delete_all(self, filters):
         cypher = """
@@ -606,17 +717,24 @@ Return updated weight, emotion, status, and analysis flags."""
 
         return final_results
 
-    def _retrieve_nodes_from_data(self, data, filters):
+    def _retrieve_nodes_from_data(self, data, filters, timings=None):
         """Extracts all the entities mentioned in the query."""
         _tools = [EXTRACT_ENTITIES_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
         
-        search_results = self.llm.generate_response(
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are a smart assistant who understands entities and their types in a given text.
+        with time_block(
+            logger,
+            "graph.entities.llm",
+            collector=timings,
+            log=timings is None,
+            user_id=filters.get("user_id"),
+        ):
+            search_results = self.llm.generate_response(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"""You are a smart assistant who understands entities and their types in a given text.
 
 Pronoun Resolution Rules:
 - First-person: If text contains 'I', 'me', 'my', 'myself' etc., use {filters['user_id']} as the entity
@@ -653,11 +771,11 @@ Contextual Labeling Rules:
 - Temporal or stage-of-life modifiers must be separate entities with entity_type 'time' or 'concept', linked via their own relationships.
 
 Extract all entities from the text with their types. ***DO NOT*** answer questions.""",
-                },
-                {"role": "user", "content": data},
-            ],
-            tools=_tools,
-        )
+                    },
+                    {"role": "user", "content": data},
+                ],
+                tools=_tools,
+            )
 
         entity_type_map = {}
 
@@ -696,7 +814,7 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         logger.debug(f"Entity type map: {entity_type_map}, search_results={search_results}")
         return entity_type_map
 
-    def _establish_nodes_relations_from_data(self, data, filters, entity_type_map):
+    def _establish_nodes_relations_from_data(self, data, filters, entity_type_map, timings=None):
         """Eshtablish relations among the extracted nodes."""
         if self.config.graph_store.custom_prompt:
             messages = [
@@ -728,10 +846,17 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [RELATIONS_STRUCT_TOOL]
 
-        extracted_entities = self.llm.generate_response(
-            messages=messages,
-            tools=_tools,
-        )
+        with time_block(
+            logger,
+            "graph.relations.llm",
+            collector=timings,
+            log=timings is None,
+            user_id=filters.get("user_id"),
+        ):
+            extracted_entities = self.llm.generate_response(
+                messages=messages,
+                tools=_tools,
+            )
 
         if extracted_entities["tool_calls"]:
             extracted_entities = extracted_entities["tool_calls"][0]["arguments"][
@@ -759,144 +884,157 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         logger.debug(f"Extracted entities: {extracted_entities}")
         return extracted_entities
 
-    def _search_graph_db(self, node_list, filters, node_labels=None, limit=100):
+    def _search_graph_db(self, node_list, filters, node_labels=None, limit=100, emit_log=True):
         """Search similar nodes and expand their relations with label-aware filtering."""
-        if not node_list:
-            return []
-
-        node_labels = node_labels or []
-        base_entries = []
-        for idx, node in enumerate(node_list):
-            label = node_labels[idx] if idx < len(node_labels) else None
-            label_norm = label.lower() if isinstance(label, str) else None
-            label_filter = label_norm if label_norm and label_norm != "unknown" else None
-            base_entries.append(
-                {
-                    "name": node,
-                    "label": label_norm,
-                    "label_filter": label_filter,
-                    "label_threshold": self._get_label_threshold(label_norm),
-                    "global_threshold": self.threshold,
-                    "embedding": self.embedding_model.embed(node),
-                }
-            )
-
-        def _prepare_search_items(entries, use_label_filter):
-            prepared = []
-            for entry in entries:
-                prepared.append(
-                    {
-                        "name": entry["name"],
-                        "embedding": entry["embedding"],
-                        "threshold": entry["label_threshold"] if use_label_filter else entry["global_threshold"],
-                        "label_filter": entry["label_filter"] if use_label_filter else None,
-                    }
-                )
-            return prepared
-
-        def _execute_anchor_query(search_items, require_label_match):
-            if not search_items:
+        start_total = perf_counter()
+        num_nodes = len(node_list) if node_list else 0
+        try:
+            if not node_list:
                 return []
 
-            cypher_query = """
-            UNWIND $search_items AS search_item
-            MATCH (n)
-            WHERE n.embedding IS NOT NULL 
-              AND n.user_id = $user_id
-            WITH search_item, n, [label IN labels(n) | toLower(label)] AS node_labels
-            WHERE $require_label_match = false OR (
-                search_item.label_filter IS NOT NULL AND search_item.label_filter IN node_labels
-            )
-            WITH search_item, n,
-                 round(2 * vector.similarity.cosine(n.embedding, search_item.embedding) - 1, 4) AS similarity
-            WHERE similarity >= search_item.threshold
-            WITH search_item, n, similarity
-            ORDER BY similarity DESC
-            WITH search_item, collect({n: n, similarity: similarity})[..$limit] AS top_nodes
-            UNWIND top_nodes AS top_node
-            WITH search_item, top_node.n AS n, top_node.similarity AS similarity, $require_label_match AS require_label_match
-            CALL (n) {
-                MATCH (n)-[r]->(m)
-                WHERE m.user_id = $user_id
-                RETURN n.name AS source, elementId(n) AS source_id, labels(n) AS source_labels, n.person_uid AS source_person_uid,
-                       type(r) AS relatationship, elementId(r) AS relation_id, 
-                       m.name AS destination, elementId(m) AS destination_id, labels(m) AS destination_labels, m.person_uid AS destination_person_uid,
-                       r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
-                       r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
-                       r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
-                UNION
-                MATCH (m)-[r]->(n)
-                WHERE m.user_id = $user_id
-                RETURN m.name AS source, elementId(m) AS source_id, labels(m) AS source_labels, m.person_uid AS source_person_uid,
-                       type(r) AS relatationship, elementId(r) AS relation_id,
-                       n.name AS destination, elementId(n) AS destination_id, labels(n) AS destination_labels, n.person_uid AS destination_person_uid,
-                       r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
-                       r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
-                       r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
-            }
-            WITH DISTINCT search_item.name AS search_term, require_label_match,
-                 source, source_id, source_labels, source_person_uid, relatationship, relation_id,
-                 destination, destination_id, destination_labels, destination_person_uid, similarity,
-                 weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
-            RETURN search_term, NOT require_label_match AS used_fallback,
-                   source, source_id, source_labels, source_person_uid, relatationship, relation_id,
-                   destination, destination_id, destination_labels, destination_person_uid, similarity,
-                   weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
-            """
-
-            params = {
-                "search_items": search_items,
-                "user_id": filters["user_id"],
-                "limit": limit,
-                "require_label_match": require_label_match,
-            }
-            return self.graph.query(cypher_query, params=params)
-
-        label_entries = [entry for entry in base_entries if entry["label_filter"]]
-        label_results = _execute_anchor_query(
-            _prepare_search_items(label_entries, use_label_filter=True),
-            require_label_match=True,
-        )
-
-        seen_terms = {row.get("search_term") for row in label_results if row.get("search_term")}
-        fallback_targets = []
-        fallback_target_names = set()
-        for entry in base_entries:
-            if entry["name"] not in seen_terms:
-                fallback_targets.append(entry)
-                fallback_target_names.add(entry["name"])
-
-        # Log which entries had to fall back after attempting label-specific anchors
-        for entry in label_entries:
-            if entry["name"] in fallback_target_names:
-                logger.info(
-                    "[label_fallback] entity=%s label=%s threshold=%.3f",
-                    entry["name"],
-                    entry["label"],
-                    entry["label_threshold"],
+            node_labels = node_labels or []
+            base_entries = []
+            for idx, node in enumerate(node_list):
+                label = node_labels[idx] if idx < len(node_labels) else None
+                label_norm = label.lower() if isinstance(label, str) else None
+                label_filter = label_norm if label_norm and label_norm != "unknown" else None
+                base_entries.append(
+                    {
+                        "name": node,
+                        "label": label_norm,
+                        "label_filter": label_filter,
+                        "label_threshold": self._get_label_threshold(label_norm),
+                        "global_threshold": self.threshold,
+                        "embedding": self.embedding_model.embed(node),
+                    }
                 )
 
-        fallback_results = _execute_anchor_query(
-            _prepare_search_items(fallback_targets, use_label_filter=False),
-            require_label_match=False,
-        )
+            def _prepare_search_items(entries, use_label_filter):
+                prepared = []
+                for entry in entries:
+                    prepared.append(
+                        {
+                            "name": entry["name"],
+                            "embedding": entry["embedding"],
+                            "threshold": entry["label_threshold"] if use_label_filter else entry["global_threshold"],
+                            "label_filter": entry["label_filter"] if use_label_filter else None,
+                        }
+                    )
+                return prepared
 
-        deduped = []
-        seen_rel_ids = set()
-        for record in label_results + fallback_results:
-            key = (
-                record.get("relation_id"),
-                record.get("source_id"),
-                record.get("destination_id"),
+            def _execute_anchor_query(search_items, require_label_match):
+                if not search_items:
+                    return []
+
+                cypher_query = """
+                UNWIND $search_items AS search_item
+                MATCH (n)
+                WHERE n.embedding IS NOT NULL 
+                  AND n.user_id = $user_id
+                WITH search_item, n, [label IN labels(n) | toLower(label)] AS node_labels
+                WHERE $require_label_match = false OR (
+                    search_item.label_filter IS NOT NULL AND search_item.label_filter IN node_labels
+                )
+                WITH search_item, n,
+                     round(2 * vector.similarity.cosine(n.embedding, search_item.embedding) - 1, 4) AS similarity
+                WHERE similarity >= search_item.threshold
+                WITH search_item, n, similarity
+                ORDER BY similarity DESC
+                WITH search_item, collect({n: n, similarity: similarity})[..$limit] AS top_nodes
+                UNWIND top_nodes AS top_node
+                WITH search_item, top_node.n AS n, top_node.similarity AS similarity, $require_label_match AS require_label_match
+                CALL (n) {
+                    MATCH (n)-[r]->(m)
+                    WHERE m.user_id = $user_id
+                    RETURN n.name AS source, elementId(n) AS source_id, labels(n) AS source_labels, n.person_uid AS source_person_uid,
+                           type(r) AS relatationship, elementId(r) AS relation_id, 
+                           m.name AS destination, elementId(m) AS destination_id, labels(m) AS destination_labels, m.person_uid AS destination_person_uid,
+                           r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                           r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                           r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
+                    UNION
+                    MATCH (m)-[r]->(n)
+                    WHERE m.user_id = $user_id
+                    RETURN m.name AS source, elementId(m) AS source_id, labels(m) AS source_labels, m.person_uid AS source_person_uid,
+                           type(r) AS relatationship, elementId(r) AS relation_id,
+                           n.name AS destination, elementId(n) AS destination_id, labels(n) AS destination_labels, n.person_uid AS destination_person_uid,
+                           r.weight AS weight, r.is_uncertain AS is_uncertain, r.status AS status,
+                           r.start_date AS start_date, r.end_date AS end_date, r.emotion AS emotion,
+                           r.last_mentioned AS last_mentioned, r.usage_count AS usage_count
+                }
+                WITH DISTINCT search_item.name AS search_term, require_label_match,
+                     source, source_id, source_labels, source_person_uid, relatationship, relation_id,
+                     destination, destination_id, destination_labels, destination_person_uid, similarity,
+                     weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+                RETURN search_term, NOT require_label_match AS used_fallback,
+                       source, source_id, source_labels, source_person_uid, relatationship, relation_id,
+                       destination, destination_id, destination_labels, destination_person_uid, similarity,
+                       weight, is_uncertain, status, start_date, end_date, emotion, last_mentioned, usage_count
+                """
+
+                params = {
+                    "search_items": search_items,
+                    "user_id": filters["user_id"],
+                    "limit": limit,
+                    "require_label_match": require_label_match,
+                }
+                return self.graph.query(cypher_query, params=params)
+
+            label_entries = [entry for entry in base_entries if entry["label_filter"]]
+            label_results = _execute_anchor_query(
+                _prepare_search_items(label_entries, use_label_filter=True),
+                require_label_match=True,
             )
-            if key in seen_rel_ids:
-                continue
-            seen_rel_ids.add(key)
-            deduped.append(record)
 
-        return deduped
+            seen_terms = {row.get("search_term") for row in label_results if row.get("search_term")}
+            fallback_targets = []
+            fallback_target_names = set()
+            for entry in base_entries:
+                if entry["name"] not in seen_terms:
+                    fallback_targets.append(entry)
+                    fallback_target_names.add(entry["name"])
 
-    def _get_delete_entities_from_search_output(self, search_output, data, filters):
+            # Log which entries had to fall back after attempting label-specific anchors
+            for entry in label_entries:
+                if entry["name"] in fallback_target_names:
+                    logger.info(
+                        "[label_fallback] entity=%s label=%s threshold=%.3f",
+                        entry["name"],
+                        entry["label"],
+                        entry["label_threshold"],
+                    )
+
+            fallback_results = _execute_anchor_query(
+                _prepare_search_items(fallback_targets, use_label_filter=False),
+                require_label_match=False,
+            )
+
+            deduped = []
+            seen_rel_ids = set()
+            for record in label_results + fallback_results:
+                key = (
+                    record.get("relation_id"),
+                    record.get("source_id"),
+                    record.get("destination_id"),
+                )
+                if key in seen_rel_ids:
+                    continue
+                seen_rel_ids.add(key)
+                deduped.append(record)
+
+            return deduped
+        finally:
+            if emit_log:
+                log_duration(
+                    logger,
+                    "graph.search_graph_db.total",
+                    start_total,
+                    user_id=filters.get("user_id"),
+                    nodes=num_nodes,
+                    limit=limit,
+                )
+
+    def _get_delete_entities_from_search_output(self, search_output, data, filters, timings=None):
         """Get the entities to be deleted from the search output."""
         search_output_string = format_entities(search_output)
         system_prompt, user_prompt = get_delete_messages(
@@ -909,13 +1047,21 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 DELETE_MEMORY_STRUCT_TOOL_GRAPH,
             ]
 
-        memory_updates = self.llm.generate_response(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            tools=_tools,
-        )
+        with time_block(
+            logger,
+            "graph.delete_detection.llm",
+            collector=timings,
+            log=timings is None,
+            user_id=filters.get("user_id"),
+            relations=len(search_output),
+        ):
+            memory_updates = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools=_tools,
+            )
         
         to_be_updated = []
         for item in memory_updates["tool_calls"]:

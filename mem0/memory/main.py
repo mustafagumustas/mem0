@@ -6,6 +6,7 @@ import uuid
 import warnings
 from datetime import datetime
 from typing import Any, Dict
+from time import perf_counter
 
 import pytz
 from pydantic import ValidationError
@@ -18,10 +19,13 @@ from mem0.memory.setup import setup_config
 from mem0.memory.storage import SQLiteManager
 from mem0.memory.telemetry import capture_event
 from mem0.memory.utils import (
+    format_timing_summary,
     get_fact_retrieval_messages,
+    log_duration,
     parse_messages,
     parse_vision_messages,
     remove_code_blocks,
+    time_block,
 )
 from mem0.utils.factory import EmbedderFactory, LlmFactory, VectorStoreFactory
 
@@ -128,196 +132,276 @@ class Memory(MemoryBase):
             Graph additions are executed before vector store writes to maintain consistency.
             If a PersonDisambiguationException is raised, no data is written to either store.
         """
+        start_total = perf_counter()
+        timings = {}
         if metadata is None:
             metadata = {}
 
         filters = filters or {}
-        if user_id:
-            filters["user_id"] = metadata["user_id"] = user_id
-        if agent_id:
-            filters["agent_id"] = metadata["agent_id"] = agent_id
-        if run_id:
-            filters["run_id"] = metadata["run_id"] = run_id
+        try:
+            if user_id:
+                filters["user_id"] = metadata["user_id"] = user_id
+            if agent_id:
+                filters["agent_id"] = metadata["agent_id"] = agent_id
+            if run_id:
+                filters["run_id"] = metadata["run_id"] = run_id
 
-        if not any(key in filters for key in ("user_id", "agent_id", "run_id")):
-            raise ValueError("One of the filters: user_id, agent_id or run_id is required!")
+            if not any(key in filters for key in ("user_id", "agent_id", "run_id")):
+                raise ValueError("One of the filters: user_id, agent_id or run_id is required!")
 
-        if isinstance(messages, str):
-            messages = [{"role": "user", "content": messages}]
+            if isinstance(messages, str):
+                messages = [{"role": "user", "content": messages}]
 
-        if self.config.llm.config.get("enable_vision"):
-            messages = parse_vision_messages(messages, self.llm, self.config.llm.config.get("vision_details"))
-        else:
-            messages = parse_vision_messages(messages)
+            with time_block(
+                logger,
+                "mem0.add.parse_vision",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                agent_id=filters.get("agent_id"),
+                infer=infer,
+            ):
+                if self.config.llm.config.get("enable_vision"):
+                    messages = parse_vision_messages(
+                        messages, self.llm, self.config.llm.config.get("vision_details")
+                    )
+                else:
+                    messages = parse_vision_messages(messages)
 
-        # Execute graph addition first to catch PersonDisambiguationException
-        # before committing to vector store (prevents store drift)
-        if self.enable_graph:
-            try:
-                graph_result = self._add_to_graph(messages, filters)
-            except PersonDisambiguationException:
-                # Re-raise immediately - don't write to vector store
-                # This includes both AmbiguousPersonException and UnconfirmedPersonException
-                raise
-            except Exception as e:
-                # For other exceptions, log and continue without graph
-                logger.error(f"Graph addition failed: {e}", exc_info=True)
+            # Execute graph addition first to catch PersonDisambiguationException
+            # before committing to vector store (prevents store drift)
+            if self.enable_graph:
+                try:
+                    with time_block(
+                        logger,
+                        "mem0.add.graph",
+                        collector=timings,
+                        log=False,
+                        user_id=filters.get("user_id"),
+                        agent_id=filters.get("agent_id"),
+                    ):
+                        graph_result = self._add_to_graph(messages, filters)
+                except PersonDisambiguationException:
+                    # Re-raise immediately - don't write to vector store
+                    # This includes both AmbiguousPersonException and UnconfirmedPersonException
+                    raise
+                except Exception as e:
+                    # For other exceptions, log and continue without graph
+                    logger.error(f"Graph addition failed: {e}", exc_info=True)
+                    graph_result = None
+            else:
                 graph_result = None
-        else:
-            graph_result = None
-        
-        # Only proceed with vector store if graph succeeded or isn't enabled
-        vector_store_result = self._add_to_vector_store(messages, metadata, filters, infer)
+            
+            # Only proceed with vector store if graph succeeded or isn't enabled
+            with time_block(
+                logger,
+                "mem0.add.vector_store",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id"),
+                agent_id=filters.get("agent_id"),
+                infer=infer,
+            ):
+                vector_store_result = self._add_to_vector_store(messages, metadata, filters, infer)
 
-        if self.api_version == "v1.0":
-            warnings.warn(
-                "The current add API output format is deprecated. "
-                "To use the latest format, set `api_version='v1.1'`. "
-                "The current format will be removed in mem0ai 1.1.0 and later versions.",
-                category=DeprecationWarning,
-                stacklevel=2,
+            if self.api_version == "v1.0":
+                warnings.warn(
+                    "The current add API output format is deprecated. "
+                    "To use the latest format, set `api_version='v1.1'`. "
+                    "The current format will be removed in mem0ai 1.1.0 and later versions.",
+                    category=DeprecationWarning,
+                    stacklevel=2,
+                )
+                return vector_store_result
+
+            if self.enable_graph:
+                return {
+                    "results": vector_store_result,
+                    "relations": graph_result,
+                }
+
+            return {"results": vector_store_result}
+        finally:
+            timings["total"] = perf_counter() - start_total
+            logger.info(
+                format_timing_summary(
+                    "mem0.add",
+                    timings,
+                    order=["total", "mem0.add.graph", "mem0.add.vector_store", "mem0.add.parse_vision"],
+                )
             )
-            return vector_store_result
-
-        if self.enable_graph:
-            return {
-                "results": vector_store_result,
-                "relations": graph_result,
-            }
-
-        return {"results": vector_store_result}
 
     def _add_to_vector_store(self, messages, metadata, filters, infer):
-        if not infer:
+        start_total = perf_counter()
+        timings = {}
+        try:
+            if not infer:
+                returned_memories = []
+                for message in messages:
+                    if message["role"] != "system":
+                        message_embeddings = self.embedding_model.embed(message["content"], "add")
+                        memory_id = self._create_memory(message["content"], message_embeddings, metadata)
+                        returned_memories.append({"id": memory_id, "memory": message["content"], "event": "ADD"})
+                return returned_memories
+
+            parsed_messages = parse_messages(messages)
+
+            if self.custom_fact_extraction_prompt:
+                system_prompt = self.custom_fact_extraction_prompt
+                user_prompt = f"Input:\n{parsed_messages}"
+            else:
+                system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages)
+
+            with time_block(
+                logger,
+                "mem0.add.vector_store.fact_extraction_llm",
+                collector=timings,
+                log=False,
+                user_id=filters.get("user_id") if filters else None,
+            ):
+                response = self.llm.generate_response(
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                    response_format={"type": "json_object"},
+                )
+
+            try:
+                response = remove_code_blocks(response)
+                new_retrieved_facts = json.loads(response)["facts"]
+            except Exception as e:
+                logging.error(f"Error in new_retrieved_facts: {e}")
+                new_retrieved_facts = []
+
+            retrieved_old_memory = []
+            new_message_embeddings = {}
+            with time_block(
+                logger,
+                "mem0.add.vector_store.search_existing",
+                collector=timings,
+                log=False,
+                facts=len(new_retrieved_facts),
+                filter_keys=list(filters.keys()) if filters else None,
+            ):
+                for new_mem in new_retrieved_facts:
+                    messages_embeddings = self.embedding_model.embed(new_mem, "add")
+                    new_message_embeddings[new_mem] = messages_embeddings
+                    existing_memories = self.vector_store.search(
+                        query=new_mem,
+                        vectors=messages_embeddings,
+                        limit=5,
+                        filters=filters,
+                    )
+                    for mem in existing_memories:
+                        retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
+            unique_data = {}
+            for item in retrieved_old_memory:
+                unique_data[item["id"]] = item
+            retrieved_old_memory = list(unique_data.values())
+            logging.info(f"Total existing memories: {len(retrieved_old_memory)}")
+
+            # mapping UUIDs with integers for handling UUID hallucinations
+            temp_uuid_mapping = {}
+            for idx, item in enumerate(retrieved_old_memory):
+                temp_uuid_mapping[str(idx)] = item["id"]
+                retrieved_old_memory[idx]["id"] = str(idx)
+
+            function_calling_prompt = get_update_memory_messages(
+                retrieved_old_memory, new_retrieved_facts, self.custom_update_memory_prompt
+            )
+
+            try:
+                with time_block(
+                    logger,
+                    "mem0.add.vector_store.update_llm",
+                    collector=timings,
+                    log=False,
+                    user_id=filters.get("user_id") if filters else None,
+                    retrieved=len(retrieved_old_memory),
+                ):
+                    new_memories_with_actions = self.llm.generate_response(
+                        messages=[{"role": "user", "content": function_calling_prompt}],
+                        response_format={"type": "json_object"},
+                    )
+            except Exception as e:
+                logging.error(f"Error in new_memories_with_actions: {e}")
+                new_memories_with_actions = []
+
+            try:
+                new_memories_with_actions = remove_code_blocks(new_memories_with_actions)
+                new_memories_with_actions = json.loads(new_memories_with_actions)
+            except Exception as e:
+                logging.error(f"Invalid JSON response: {e}")
+                new_memories_with_actions = []
+
             returned_memories = []
-            for message in messages:
-                if message["role"] != "system":
-                    message_embeddings = self.embedding_model.embed(message["content"], "add")
-                    memory_id = self._create_memory(message["content"], message_embeddings, metadata)
-                    returned_memories.append({"id": memory_id, "memory": message["content"], "event": "ADD"})
+            try:
+                for resp in new_memories_with_actions.get("memory", []):
+                    logging.info(resp)
+                    try:
+                        if not resp.get("text"):
+                            logging.info("Skipping memory entry because of empty `text` field.")
+                            continue
+                        elif resp.get("event") == "ADD":
+                            memory_id = self._create_memory(
+                                data=resp.get("text"), existing_embeddings=new_message_embeddings, metadata=metadata
+                            )
+                            returned_memories.append(
+                                {
+                                    "id": memory_id,
+                                    "memory": resp.get("text"),
+                                    "event": resp.get("event"),
+                                }
+                            )
+                        elif resp.get("event") == "UPDATE":
+                            self._update_memory(
+                                memory_id=temp_uuid_mapping[resp["id"]],
+                                data=resp.get("text"),
+                                existing_embeddings=new_message_embeddings,
+                                metadata=metadata,
+                            )
+                            returned_memories.append(
+                                {
+                                    "id": temp_uuid_mapping[resp.get("id")],
+                                    "memory": resp.get("text"),
+                                    "event": resp.get("event"),
+                                    "previous_memory": resp.get("old_memory"),
+                                }
+                            )
+                        elif resp.get("event") == "DELETE":
+                            self._delete_memory(memory_id=temp_uuid_mapping[resp.get("id")])
+                            returned_memories.append(
+                                {
+                                    "id": temp_uuid_mapping[resp.get("id")],
+                                    "memory": resp.get("text"),
+                                    "event": resp.get("event"),
+                                }
+                            )
+                        elif resp.get("event") == "NONE":
+                            logging.info("NOOP for Memory.")
+                    except Exception as e:
+                        logging.error(f"Error in new_memories_with_actions: {e}")
+            except Exception as e:
+                logging.error(f"Error in new_memories_with_actions: {e}")
+
+            capture_event("mem0.add", self, {"version": self.api_version, "keys": list(filters.keys())})
+
             return returned_memories
-
-        parsed_messages = parse_messages(messages)
-
-        if self.custom_fact_extraction_prompt:
-            system_prompt = self.custom_fact_extraction_prompt
-            user_prompt = f"Input:\n{parsed_messages}"
-        else:
-            system_prompt, user_prompt = get_fact_retrieval_messages(parsed_messages)
-
-        response = self.llm.generate_response(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            response_format={"type": "json_object"},
-        )
-
-        try:
-            response = remove_code_blocks(response)
-            new_retrieved_facts = json.loads(response)["facts"]
-        except Exception as e:
-            logging.error(f"Error in new_retrieved_facts: {e}")
-            new_retrieved_facts = []
-
-        retrieved_old_memory = []
-        new_message_embeddings = {}
-        for new_mem in new_retrieved_facts:
-            messages_embeddings = self.embedding_model.embed(new_mem, "add")
-            new_message_embeddings[new_mem] = messages_embeddings
-            existing_memories = self.vector_store.search(
-                query=new_mem,
-                vectors=messages_embeddings,
-                limit=5,
-                filters=filters,
+        finally:
+            timings["total"] = perf_counter() - start_total
+            logger.info(
+                format_timing_summary(
+                    "mem0.add.vector_store",
+                    timings,
+                    order=[
+                        "total",
+                        "mem0.add.vector_store.fact_extraction_llm",
+                        "mem0.add.vector_store.search_existing",
+                        "mem0.add.vector_store.update_llm",
+                    ],
+                )
             )
-            for mem in existing_memories:
-                retrieved_old_memory.append({"id": mem.id, "text": mem.payload["data"]})
-        unique_data = {}
-        for item in retrieved_old_memory:
-            unique_data[item["id"]] = item
-        retrieved_old_memory = list(unique_data.values())
-        logging.info(f"Total existing memories: {len(retrieved_old_memory)}")
-
-        # mapping UUIDs with integers for handling UUID hallucinations
-        temp_uuid_mapping = {}
-        for idx, item in enumerate(retrieved_old_memory):
-            temp_uuid_mapping[str(idx)] = item["id"]
-            retrieved_old_memory[idx]["id"] = str(idx)
-
-        function_calling_prompt = get_update_memory_messages(
-            retrieved_old_memory, new_retrieved_facts, self.custom_update_memory_prompt
-        )
-
-        try:
-            new_memories_with_actions = self.llm.generate_response(
-                messages=[{"role": "user", "content": function_calling_prompt}],
-                response_format={"type": "json_object"},
-            )
-        except Exception as e:
-            logging.error(f"Error in new_memories_with_actions: {e}")
-            new_memories_with_actions = []
-
-        try:
-            new_memories_with_actions = remove_code_blocks(new_memories_with_actions)
-            new_memories_with_actions = json.loads(new_memories_with_actions)
-        except Exception as e:
-            logging.error(f"Invalid JSON response: {e}")
-            new_memories_with_actions = []
-
-        returned_memories = []
-        try:
-            for resp in new_memories_with_actions.get("memory", []):
-                logging.info(resp)
-                try:
-                    if not resp.get("text"):
-                        logging.info("Skipping memory entry because of empty `text` field.")
-                        continue
-                    elif resp.get("event") == "ADD":
-                        memory_id = self._create_memory(
-                            data=resp.get("text"), existing_embeddings=new_message_embeddings, metadata=metadata
-                        )
-                        returned_memories.append(
-                            {
-                                "id": memory_id,
-                                "memory": resp.get("text"),
-                                "event": resp.get("event"),
-                            }
-                        )
-                    elif resp.get("event") == "UPDATE":
-                        self._update_memory(
-                            memory_id=temp_uuid_mapping[resp["id"]],
-                            data=resp.get("text"),
-                            existing_embeddings=new_message_embeddings,
-                            metadata=metadata,
-                        )
-                        returned_memories.append(
-                            {
-                                "id": temp_uuid_mapping[resp.get("id")],
-                                "memory": resp.get("text"),
-                                "event": resp.get("event"),
-                                "previous_memory": resp.get("old_memory"),
-                            }
-                        )
-                    elif resp.get("event") == "DELETE":
-                        self._delete_memory(memory_id=temp_uuid_mapping[resp.get("id")])
-                        returned_memories.append(
-                            {
-                                "id": temp_uuid_mapping[resp.get("id")],
-                                "memory": resp.get("text"),
-                                "event": resp.get("event"),
-                            }
-                        )
-                    elif resp.get("event") == "NONE":
-                        logging.info("NOOP for Memory.")
-                except Exception as e:
-                    logging.error(f"Error in new_memories_with_actions: {e}")
-        except Exception as e:
-            logging.error(f"Error in new_memories_with_actions: {e}")
-
-        capture_event("mem0.add", self, {"version": self.api_version, "keys": list(filters.keys())})
-
-        return returned_memories
 
     def _add_to_graph(self, messages, filters):
         added_entities = []
@@ -458,6 +542,8 @@ class Memory(MemoryBase):
             list: List of search results.
         """
         filters = filters or {}
+        start_total = perf_counter()
+        timings = {}
         if user_id:
             filters["user_id"] = user_id
         if agent_id:
@@ -474,18 +560,38 @@ class Memory(MemoryBase):
             {"limit": limit, "version": self.api_version, "keys": list(filters.keys())},
         )
 
-        with concurrent.futures.ThreadPoolExecutor() as executor:
-            future_memories = executor.submit(self._search_vector_store, query, filters, limit)
-            future_graph_entities = (
-                executor.submit(self.graph.search, query, filters, limit) if self.enable_graph else None
-            )
+        graph_entities = None
+        try:
+            vector_start = perf_counter()
+            graph_start = None
+            with concurrent.futures.ThreadPoolExecutor() as executor:
+                future_memories = executor.submit(self._search_vector_store, query, filters, limit)
+                if self.enable_graph:
+                    graph_start = perf_counter()
+                    future_graph_entities = executor.submit(self.graph.search, query, filters, limit)
+                else:
+                    future_graph_entities = None
 
-            concurrent.futures.wait(
-                [future_memories, future_graph_entities] if future_graph_entities else [future_memories]
-            )
+                concurrent.futures.wait(
+                    [future_memories, future_graph_entities] if future_graph_entities else [future_memories]
+                )
 
-            original_memories = future_memories.result()
-            graph_entities = future_graph_entities.result() if future_graph_entities else None
+                original_memories = future_memories.result()
+                timings["mem0.search.vector_store"] = perf_counter() - vector_start
+                graph_entities = None
+                if future_graph_entities:
+                    graph_entities = future_graph_entities.result()
+                    if graph_start:
+                        timings["mem0.search.graph"] = perf_counter() - graph_start
+        finally:
+            timings["total"] = perf_counter() - start_total
+            logger.info(
+                format_timing_summary(
+                    "mem0.search",
+                    timings,
+                    order=["total", "mem0.search.vector_store", "mem0.search.graph"],
+                )
+            )
 
         if self.enable_graph:
             return {"results": original_memories, "relations": graph_entities}

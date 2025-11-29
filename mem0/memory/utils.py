@@ -1,4 +1,6 @@
 import re
+from contextlib import contextmanager
+from time import perf_counter
 
 from mem0.configs.prompts import FACT_RETRIEVAL_PROMPT
 
@@ -98,3 +100,74 @@ def parse_vision_messages(messages, llm=None, vision_details="auto"):
             returned_messages.append(msg)
 
     return returned_messages
+
+
+def _format_timing_details(details: dict) -> str:
+    """Build a simple key=value string for timing logs."""
+    parts = []
+    for key, value in details.items():
+        if value is None:
+            continue
+        try:
+            parts.append(f"{key}={value}")
+        except Exception:
+            parts.append(f"{key}=<unserializable>")
+    return ", ".join(parts)
+
+
+def log_duration(logger, label: str, start_time: float, **details) -> float:
+    """Log duration for an operation."""
+    try:
+        elapsed = perf_counter() - start_time
+    except Exception:
+        return 0.0
+    detail_str = _format_timing_details(details)
+    if detail_str:
+        logger.info("[timing] %s=%.3fs | %s", label, elapsed, detail_str)
+    else:
+        logger.info("[timing] %s=%.3fs", label, elapsed)
+    return elapsed
+
+
+@contextmanager
+def time_block(logger, label: str, collector: dict = None, log: bool = True, **details):
+    """
+    Context manager to log how long a block takes.
+    
+    Args:
+        logger: Logger to use.
+        label: Key for the timing entry.
+        collector: Optional dict to collect timings instead of immediate logging.
+        log: Whether to log immediately.
+    """
+    start_time = perf_counter()
+    try:
+        yield
+    finally:
+        elapsed = perf_counter() - start_time
+        if collector is not None:
+            collector[label] = elapsed
+        if log:
+            detail_str = _format_timing_details(details)
+            if detail_str:
+                logger.info("[timing] %s=%.3fs | %s", label, elapsed, detail_str)
+            else:
+                logger.info("[timing] %s=%.3fs", label, elapsed)
+
+
+def format_timing_summary(label: str, timings: dict, order=None) -> str:
+    """
+    Build a concise timing summary string.
+    """
+    parts = []
+    ordered_keys = order or []
+    seen = set()
+    for key in ordered_keys:
+        if key in timings:
+            parts.append(f"{key}={timings[key]:.3f}s")
+            seen.add(key)
+    for key, value in timings.items():
+        if key in seen:
+            continue
+        parts.append(f"{key}={value:.3f}s")
+    return f"[timing_summary] {label} " + " | ".join(parts)
