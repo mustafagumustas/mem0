@@ -1,3 +1,4 @@
+import json
 import logging
 from datetime import datetime
 import pytz
@@ -449,7 +450,7 @@ Return updated weight, emotion, status, and analysis flags."""
         _tools = [EXTRACT_ENTITIES_TOOL]
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
-        
+
         search_results = self.llm.generate_response(
             messages=[
                 {
@@ -488,8 +489,27 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         entity_type_map = {}
 
         try:
-            for item in search_results["tool_calls"][0]["arguments"]["entities"]:
-                entity_type_map[item["entity"]] = item["entity_type"]
+            raw_entities = []
+            tool_calls = search_results.get("tool_calls") or []
+            if tool_calls:
+                raw_entities = tool_calls[0].get("arguments", {}).get("entities", [])
+            else:
+                raw_content = search_results.get("content")
+                if raw_content:
+                    try:
+                        parsed = json.loads(raw_content)
+                        raw_entities = parsed.get("entities", [])
+                    except json.JSONDecodeError:
+                        logger.warning(
+                            "Failed to parse entity extractor content as JSON: %s",
+                            raw_content,
+                        )
+
+            for item in raw_entities:
+                entity = item.get("entity")
+                entity_type = item.get("entity_type")
+                if entity and entity_type:
+                    entity_type_map[entity] = entity_type
         except Exception as e:
             logger.exception(
                 f"Error in search tool: {e}, llm_provider={self.llm_provider}, search_results={search_results}"
@@ -540,18 +560,44 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             tools=_tools,
         )
 
-        if extracted_entities["tool_calls"]:
-            extracted_entities = extracted_entities["tool_calls"][0]["arguments"][
-                "entities"
-            ]
+        extracted_entities_list = []
+
+        try:
+            tool_calls = []
+            if isinstance(extracted_entities, dict):
+                tool_calls = extracted_entities.get("tool_calls") or []
+
+            if tool_calls:
+                first_call = tool_calls[0] if isinstance(tool_calls, list) else tool_calls
+                if isinstance(first_call, dict):
+                    extracted_entities_list = first_call.get("arguments", {}).get("entities") or []
+
+            # Fallback: some LLMs may return entities directly in content instead of a tool call
+            if not extracted_entities_list and isinstance(extracted_entities, dict):
+                content = extracted_entities.get("content")
+                content_json = None
+
+                if isinstance(content, str):
+                    try:
+                        content_json = json.loads(content)
+                    except json.JSONDecodeError:
+                        content_json = None
+                elif isinstance(content, dict):
+                    content_json = content
+
+                if isinstance(content_json, dict):
+                    extracted_entities_list = content_json.get("entities") or []
+
             # Log emotions for debugging - using mem0 format
-            for entity in extracted_entities:
+            for entity in extracted_entities_list:
                 emotion = entity.get("emotion")
                 logger.info(f"LLM extracted: {entity.get('source', '?')} -> {entity.get('relationship', '?')} -> {entity.get('destination', '?')}, emotion='{emotion}'")
-        else:
-            extracted_entities = []
+        except Exception as e:
+            logger.exception(
+                f"Error parsing relations tool response: {e}, llm_provider={self.llm_provider}, extracted_entities={extracted_entities}"
+            )
 
-        extracted_entities = self._remove_spaces_from_entities(extracted_entities)
+        extracted_entities = self._remove_spaces_from_entities(extracted_entities_list)
         
         logger.debug(f"Extracted entities: {extracted_entities}")
         return extracted_entities
