@@ -1,5 +1,9 @@
 import json
 import logging
+import os
+import uuid
+from contextlib import contextmanager
+from time import perf_counter
 from datetime import datetime
 import pytz
 import asyncio
@@ -40,6 +44,7 @@ logger = logging.getLogger(__name__)
 class MemoryGraph:
     def __init__(self, config):
         self.config = config
+        self.trace_enabled = os.getenv("MEM0_TRACE", "1") != "0"
         self.graph = Neo4jGraph(
             self.config.graph_store.config.url,
             self.config.graph_store.config.username,
@@ -61,6 +66,35 @@ class MemoryGraph:
         
         # Thread pool for background weight adjustments
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="weight_adjuster")
+
+    def _log(self, level=logging.INFO, **fields):
+        """Lightweight structured logging helper."""
+        if not self.trace_enabled:
+            return
+        try:
+            msg = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            logger.log(level, msg)
+        except Exception:
+            logger.exception("Failed to emit trace log", exc_info=True)
+
+    @contextmanager
+    def _log_span(self, event, level=logging.INFO, log_start=True, **fields):
+        """
+        Context manager to log start/end/duration for latency-sensitive operations.
+        """
+        if not self.trace_enabled:
+            yield
+            return
+        start = perf_counter()
+        if log_start:
+            self._log(level, event=event, phase="start", **fields)
+        try:
+            yield
+            duration_ms = round((perf_counter() - start) * 1000, 2)
+            self._log(level, event=event, phase="end", duration_ms=duration_ms, **fields)
+        except Exception as e:
+            self._log(logging.ERROR, event=event, phase="error", error=str(e), **fields)
+            raise
 
     def _analyze_relation_evolution(self, current_relation, session_history, graph_context, user_id):
         """
@@ -114,10 +148,18 @@ Return updated weight, emotion, status, and analysis flags."""
         
         _tools = [ANALYZE_RELATION_EVOLUTION_TOOL]
 
-        response = self.llm.generate_response(
-            messages=messages,
-            tools=_tools,
-        )
+        with self._log_span(
+            "llm_analyze_relation_evolution",
+            user_id=user_id,
+            trace_id=None,
+            provider=self.llm_provider,
+            relationship=current_relation.get("relatationship"),
+            log_start=False,  # reduce noise; keep duration
+        ):
+            response = self.llm.generate_response(
+                messages=messages,
+                tools=_tools,
+            )
 
         if response and response.get("tool_calls"):
             tool_call = response["tool_calls"][0]
@@ -181,83 +223,102 @@ Return updated weight, emotion, status, and analysis flags."""
             data (str): The data to add to the graph.
             filters (dict): A dictionary containing filters to be applied during the addition.
         """
-        # Step 1: Retrieve nodes from data
-        entity_type_map = self._retrieve_nodes_from_data(data, filters)
-        
-        # Step 2: Establish relations from data
-        to_be_added = self._establish_nodes_relations_from_data(
-            data, filters, entity_type_map
-        )
-        
-        # Step 3: Search graph database
-        search_output = self._search_graph_db(
-            node_list=list(entity_type_map.keys()), filters=filters
-        )
-        
-        # Step 4: Analyze and update existing relations
-        # NOTE: Weight adjustment is now done during search operations, not during add
-        # This makes add operations faster and analyzes weights based on actual usage
-        # evolution_updates = self.analyze_and_update_existing_relations(search_output, data, filters)
-        evolution_updates = []  # Disabled - now handled in search
-        
-        # Step 5: Get delete entities from search output
-        to_be_updated = self._get_delete_entities_from_search_output(
-            search_output, data, filters
-        )
+        trace_id = filters.get("trace_id")
+        with self._log_span(
+            "add",
+            user_id=filters.get("user_id"),
+            trace_id=trace_id,
+        ):
+            # Step 1: Retrieve nodes from data
+            entity_type_map = self._retrieve_nodes_from_data(data, filters)
+            
+            # Step 2: Establish relations from data
+            to_be_added = self._establish_nodes_relations_from_data(
+                data, filters, entity_type_map
+            )
+            
+            # Step 3: Search graph database
+            search_output = self._search_graph_db(
+                node_list=list(entity_type_map.keys()), filters=filters
+            )
+            
+            # Step 4: Analyze and update existing relations
+            # NOTE: Weight adjustment is now done during search operations, not during add
+            # This makes add operations faster and analyzes weights based on actual usage
+            # evolution_updates = self.analyze_and_update_existing_relations(search_output, data, filters)
+            evolution_updates = []  # Disabled - now handled in search
+            
+            # Step 5: Get delete entities from search output
+            # NOTE: delete/deactivation stage temporarily disabled for performance; re-enable later if needed.
+            # original call:
+            # to_be_updated = self._get_delete_entities_from_search_output(
+            #     search_output, data, filters
+            # )
 
-        # TODO: Batch queries with APOC plugin
-        # TODO: Add more filter support
-        
-        # Step 6: Process relationship updates
-        updated_entities = self._process_relationship_updates(to_be_updated, filters["user_id"])
-        
-        updated_entities.extend(evolution_updates)
-        
-        # Step 7: Add entities
-        added_entities = self._add_entities(
-            to_be_added, filters["user_id"], entity_type_map
-        )
+            # TODO: Batch queries with APOC plugin
+            # TODO: Add more filter support
+            
+            # Step 6: Process relationship updates
+            # NOTE: delete/deactivation stage temporarily disabled for performance; re-enable later if needed.
+            # original call:
+            # updated_entities = self._process_relationship_updates(to_be_updated, filters["user_id"])
+            updated_entities = []
+            
+            updated_entities.extend(evolution_updates)
+            
+            # Step 7: Add entities
+            added_entities = self._add_entities(
+                to_be_added, filters["user_id"], entity_type_map
+            )
 
-        return {"updated_entities": updated_entities, "added_entities": added_entities}
+            return {"updated_entities": updated_entities, "added_entities": added_entities}
 
     def _background_weight_adjustment(self, search_results, query, filters):
         """
         Background task to analyze and update weights of relationships based on search results.
         This runs asynchronously and doesn't block the search response.
         """
-        try:
-            logger.info(f"Starting background weight adjustment for {len(search_results)} search results")
-            
-            # Convert search results back to the format expected by analyze_and_update_existing_relations
-            # Note: search results have 'relationship' while internal format uses 'relatationship'
-            search_output_format = []
-            for result in search_results:
-                formatted_result = {
-                    "source": result["source"],
-                    "relatationship": result["relationship"],  # Map back to internal format
-                    "destination": result.get("destination") or result.get("target"),
-                }
+        job_id = f"bg-{threading.get_ident()}"
+        with self._log_span(
+            "background_weight_adjustment",
+            user_id=filters.get("user_id"),
+            trace_id=filters.get("trace_id"),
+            job_id=job_id,
+            result_count=len(search_results),
+        ):
+            try:
+                logger.info(f"Starting background weight adjustment for {len(search_results)} search results")
                 
-                # Copy all other properties
-                for key in ["weight", "is_uncertain", "status", "start_date", "end_date", 
-                           "emotion", "last_mentioned", "usage_count"]:
-                    if key in result:
-                        formatted_result[key] = result[key]
+                # Convert search results back to the format expected by analyze_and_update_existing_relations
+                # Note: search results have 'relationship' while internal format uses 'relatationship'
+                search_output_format = []
+                for result in search_results:
+                    formatted_result = {
+                        "source": result["source"],
+                        "relatationship": result["relationship"],  # Map back to internal format
+                        "destination": result.get("destination") or result.get("target"),
+                    }
+                    
+                    # Copy all other properties
+                    for key in ["weight", "is_uncertain", "status", "start_date", "end_date", 
+                               "emotion", "last_mentioned", "usage_count"]:
+                        if key in result:
+                            formatted_result[key] = result[key]
+                    
+                    search_output_format.append(formatted_result)
                 
-                search_output_format.append(formatted_result)
-            
-            # Use the search query as the session history/context for weight analysis
-            # This gives the LLM context about what the user was looking for
-            updated_relations = self.analyze_and_update_existing_relations(
-                search_output_format, 
-                query,  # Use search query as the "data" parameter
-                filters
-            )
-            
-            logger.info(f"Background weight adjustment completed. Updated {len(updated_relations)} relationships")
-            
-        except Exception as e:
-            logger.error(f"Error in background weight adjustment: {e}", exc_info=True)
+                # Use the search query as the session history/context for weight analysis
+                # This gives the LLM context about what the user was looking for
+                updated_relations = self.analyze_and_update_existing_relations(
+                    search_output_format, 
+                    query,  # Use search query as the "data" parameter
+                    filters
+                )
+                
+                logger.info(f"Background weight adjustment completed. Updated {len(updated_relations)} relationships")
+                
+            except Exception as e:
+                logger.error(f"Error in background weight adjustment: {e}", exc_info=True)
 
     def search(self, query, filters, limit=100):
         """
@@ -273,94 +334,109 @@ Return updated weight, emotion, status, and analysis flags."""
                 - "contexts": List of search results from the base data store.
                 - "entities": List of related graph data based on the query.
         """
-        # Step 1: Retrieve nodes from query
-        entity_type_map = self._retrieve_nodes_from_data(query, filters)
-        
-        # Step 2: Search graph database
-        search_output = self._search_graph_db(
-            node_list=list(entity_type_map.keys()), filters=filters
-        )
+        trace_id = filters.get("trace_id")
+        with self._log_span(
+            "search",
+            user_id=filters.get("user_id"),
+            trace_id=trace_id,
+            limit=limit,
+        ):
+            # Step 1: Retrieve nodes from query
+            entity_type_map = self._retrieve_nodes_from_data(query, filters)
+            
+            # Step 2: Search graph database
+            search_output = self._search_graph_db(
+                node_list=list(entity_type_map.keys()), filters=filters
+            )
 
-        if not search_output:
-            return []
+            if not search_output:
+                return []
 
-        # Step 3: Prepare for BM25 ranking
-        search_outputs_sequence = [
-            [item["source"], item["relatationship"], item["destination"]]
-            for item in search_output
-        ]
-        bm25 = BM25Okapi(search_outputs_sequence)
+            # Step 3: Prepare for BM25 ranking
+            search_outputs_sequence = [
+                [item["source"], item["relatationship"], item["destination"]]
+                for item in search_output
+            ]
+            bm25 = BM25Okapi(search_outputs_sequence)
 
-        tokenized_query = query.split(" ")
-        reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=15)
+            tokenized_query = query.split(" ")
+            with self._log_span(
+                "bm25_rerank",
+                user_id=filters.get("user_id"),
+                trace_id=trace_id,
+                candidate_count=len(search_outputs_sequence),
+            ):
+                reranked_results = bm25.get_top_n(tokenized_query, search_outputs_sequence, n=15)
 
-        # Step 4: Build final results and update metadata
-        search_results = []
-        current_time_iso = datetime.now(pytz.utc).isoformat()
-        
-        for item in reranked_results:
-            # Find the original item to retrieve all properties
-            for orig_item in search_output:
-                if (
-                    orig_item["source"] == item[0]
-                    and orig_item["relatationship"] == item[1]
-                    and orig_item["destination"] == item[2]
-                ):
+            # Step 4: Build final results and update metadata
+            search_results = []
+            current_time_iso = datetime.now(pytz.utc).isoformat()
+            relationship_updates = {}
+            node_updates = {}
+            
+            for item in reranked_results:
+                result_dict = None
 
-                    result_dict = {
-                        "source": item[0],
-                        "relationship": item[1],
-                        "destination": item[2],
-                    }
+                # Find the original item to retrieve all properties
+                for orig_item in search_output:
+                    if (
+                        orig_item["source"] == item[0]
+                        and orig_item["relatationship"] == item[1]
+                        and orig_item["destination"] == item[2]
+                    ):
 
-                    # Add optional parameters if they exist
-                    if orig_item.get("weight") is not None:
-                        result_dict["weight"] = orig_item["weight"]
-                    if orig_item.get("is_uncertain") is not None:
-                        result_dict["is_uncertain"] = orig_item["is_uncertain"]
-                    if orig_item.get("status") is not None:
-                        result_dict["status"] = orig_item["status"]
-                    if orig_item.get("start_date") is not None:
-                        result_dict["start_date"] = orig_item["start_date"]
-                    if orig_item.get("end_date") is not None:
-                        result_dict["end_date"] = orig_item["end_date"]
-                    if orig_item.get("emotion") is not None:
-                        result_dict["emotion"] = orig_item["emotion"]
-                    if orig_item.get("last_mentioned") is not None:
-                        result_dict["last_mentioned"] = orig_item["last_mentioned"]
-                    if orig_item.get("usage_count") is not None:
-                        result_dict["usage_count"] = orig_item["usage_count"]
+                        result_dict = {
+                            "source": item[0],
+                            "relationship": item[1],
+                            "destination": item[2],
+                        }
 
-                    # Update mention metadata for this selected relationship
-                    self.update_mention_metadata(result_dict, current_time_iso, filters["user_id"])
-                    
-                    # Update mention metadata for nodes referenced in this relationship
-                    self.update_node_mention_metadata(item[0], current_time_iso, filters["user_id"])
-                    self.update_node_mention_metadata(item[2], current_time_iso, filters["user_id"])
+                        # Add optional parameters if they exist
+                        if orig_item.get("weight") is not None:
+                            result_dict["weight"] = orig_item["weight"]
+                        if orig_item.get("is_uncertain") is not None:
+                            result_dict["is_uncertain"] = orig_item["is_uncertain"]
+                        if orig_item.get("status") is not None:
+                            result_dict["status"] = orig_item["status"]
+                        if orig_item.get("start_date") is not None:
+                            result_dict["start_date"] = orig_item["start_date"]
+                        if orig_item.get("end_date") is not None:
+                            result_dict["end_date"] = orig_item["end_date"]
+                        if orig_item.get("emotion") is not None:
+                            result_dict["emotion"] = orig_item["emotion"]
+                        if orig_item.get("last_mentioned") is not None:
+                            result_dict["last_mentioned"] = orig_item["last_mentioned"]
+                        if orig_item.get("usage_count") is not None:
+                            result_dict["usage_count"] = orig_item["usage_count"]
+                        break
+                else:
+                    # Fallback if original item not found
+                    result_dict = {"source": item[0], "relationship": item[1], "destination": item[2]}
 
-                    search_results.append(result_dict)
-                    break
-            else:
-                # Fallback if original item not found
-                fallback_result = {"source": item[0], "relationship": item[1], "destination": item[2]}
-                # Still update metadata even for fallback case
-                self.update_mention_metadata(fallback_result, current_time_iso, filters["user_id"])
-                self.update_node_mention_metadata(item[0], current_time_iso, filters["user_id"])
-                self.update_node_mention_metadata(item[2], current_time_iso, filters["user_id"])
-                search_results.append(fallback_result)
+                search_results.append(result_dict)
 
-        logger.info(f"Returned {len(search_results)} search results")
+                rel_key = (result_dict["source"], result_dict["relationship"], result_dict["destination"])
+                relationship_updates[rel_key] = relationship_updates.get(rel_key, 0) + 1
+                node_updates[result_dict["source"]] = node_updates.get(result_dict["source"], 0) + 1
+                node_updates[result_dict["destination"]] = node_updates.get(result_dict["destination"], 0) + 1
 
-        # Trigger weight adjustment in the background without blocking
-        # Pass the search query as context for better weight analysis
-        self._executor.submit(
-            self._background_weight_adjustment, 
-            search_results.copy(),  # Copy to avoid modification issues
-            query,  # Pass the search query as context
-            filters
-        )
+            # Batch mention metadata updates to avoid per-item writes during search
+            self.bulk_update_mention_metadata(relationship_updates, current_time_iso, filters["user_id"])
+            self.bulk_update_node_mention_metadata(node_updates, current_time_iso, filters["user_id"])
 
-        return search_results
+            logger.info(f"Returned {len(search_results)} search results")
+
+            # Trigger weight adjustment in the background without blocking
+            # Pass the search query as context for better weight analysis
+            # froze this below, cause it might be slowing down the funciton
+            # self._executor.submit(
+            #     self._background_weight_adjustment, 
+            #     search_results.copy(),  # Copy to avoid modification issues
+            #     query,  # Pass the search query as context
+            #     filters
+            # )
+
+            return search_results
 
     def delete_all(self, filters):
         cypher = """
@@ -406,6 +482,8 @@ Return updated weight, emotion, status, and analysis flags."""
 
         final_results = []
         current_time_iso = datetime.now(pytz.utc).isoformat()
+        relationship_updates = {}
+        node_updates = {}
         
         for result in results:
             result_dict = {
@@ -432,14 +510,16 @@ Return updated weight, emotion, status, and analysis flags."""
             if result.get("usage_count") is not None:
                 result_dict["usage_count"] = result["usage_count"]
 
-            # Update mention metadata for this retrieved relationship
-            self.update_mention_metadata(result_dict, current_time_iso, filters["user_id"])
-            
-            # Update mention metadata for nodes referenced in this relationship
-            self.update_node_mention_metadata(result["source"], current_time_iso, filters["user_id"])
-            self.update_node_mention_metadata(result["target"], current_time_iso, filters["user_id"])
+            rel_key = (result["source"], result["relationship"], result["target"])
+            relationship_updates[rel_key] = relationship_updates.get(rel_key, 0) + 1
+            node_updates[result["source"]] = node_updates.get(result["source"], 0) + 1
+            node_updates[result["target"]] = node_updates.get(result["target"], 0) + 1
 
             final_results.append(result_dict)
+
+        # Batch mention metadata updates to avoid per-item writes during bulk retrieval
+        self.bulk_update_mention_metadata(relationship_updates, current_time_iso, filters["user_id"])
+        self.bulk_update_node_mention_metadata(node_updates, current_time_iso, filters["user_id"])
 
         logger.info(f"Retrieved {len(final_results)} relationships")
 
@@ -451,11 +531,18 @@ Return updated weight, emotion, status, and analysis flags."""
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [EXTRACT_ENTITIES_STRUCT_TOOL]
 
-        search_results = self.llm.generate_response(
-            messages=[
-                {
-                    "role": "system",
-                    "content": f"""You are a smart assistant who understands entities and their types in a given text.
+        with self._log_span(
+            "llm_extract_entities",
+            user_id=filters.get("user_id"),
+            trace_id=filters.get("trace_id"),
+            provider=self.llm_provider,
+            log_start=False,  # only duration to reduce noise
+        ):
+            search_results = self.llm.generate_response(
+                messages=[
+                    {
+                        "role": "system",
+                        "content": f"""You are a smart assistant who understands entities and their types in a given text.
 
 Pronoun Resolution Rules:
 - First-person: If text contains 'I', 'me', 'my', 'myself' etc., use {filters['user_id']} as the entity
@@ -555,10 +642,17 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
         if self.llm_provider in ["azure_openai_structured", "openai_structured"]:
             _tools = [RELATIONS_STRUCT_TOOL]
 
-        extracted_entities = self.llm.generate_response(
-            messages=messages,
-            tools=_tools,
-        )
+        with self._log_span(
+            "llm_extract_relations",
+            user_id=filters.get("user_id"),
+            trace_id=filters.get("trace_id"),
+            provider=self.llm_provider,
+            log_start=False,  # only duration to reduce noise
+        ):
+            extracted_entities = self.llm.generate_response(
+                messages=messages,
+                tools=_tools,
+            )
 
         extracted_entities_list = []
 
@@ -666,7 +760,14 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             "limit": limit,
         }
 
-        result_relations = self.graph.query(cypher_query, params=params)
+        with self._log_span(
+            "neo4j_search_graph",
+            user_id=filters.get("user_id"),
+            trace_id=filters.get("trace_id"),
+            node_count=len(node_list),
+            threshold=self.threshold,
+        ):
+            result_relations = self.graph.query(cypher_query, params=params)
 
         return result_relations
 
@@ -683,13 +784,20 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                 DELETE_MEMORY_STRUCT_TOOL_GRAPH,
             ]
 
-        memory_updates = self.llm.generate_response(
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-            tools=_tools,
-        )
+        with self._log_span(
+            "llm_delete_graph_memory",
+            user_id=filters.get("user_id"),
+            trace_id=filters.get("trace_id"),
+            provider=self.llm_provider,
+            log_start=False,  # only duration to reduce noise
+        ):
+            memory_updates = self.llm.generate_response(
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                tools=_tools,
+            )
         
         to_be_updated = []
         for item in memory_updates["tool_calls"]:
@@ -866,7 +974,15 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     params["usage_count"] = usage_count
 
                 logger.debug(f"Executing Cypher (source exists): {cypher} with params: {params}")
-                resp = self.graph.query(cypher, params=params)
+                with self._log_span(
+                    "neo4j_upsert_relationship",
+                    user_id=user_id,
+                    source=source,
+                    destination=destination,
+                    relationship=relationship,
+                    log_start=False,
+                ):
+                    resp = self.graph.query(cypher, params=params)
                 logger.debug(f"Graph query response: {resp}")
                 results.append(resp)
 
@@ -948,7 +1064,15 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     params["usage_count"] = usage_count
 
                 logger.debug(f"Executing Cypher (destination exists): {cypher} with params: {params}")
-                resp = self.graph.query(cypher, params=params)
+                with self._log_span(
+                    "neo4j_upsert_relationship",
+                    user_id=user_id,
+                    source=source,
+                    destination=destination,
+                    relationship=relationship,
+                    log_start=False,
+                ):
+                    resp = self.graph.query(cypher, params=params)
                 logger.debug(f"Graph query response: {resp}")
                 results.append(resp)
 
@@ -1030,7 +1154,14 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     params["usage_count"] = usage_count
 
                 logger.debug(f"Executing Cypher (both exist): {cypher} with params: {params}")
-                resp = self.graph.query(cypher, params=params)
+                with self._log_span(
+                    "neo4j_upsert_relationship",
+                    user_id=user_id,
+                    source=source,
+                    destination=destination,
+                    relationship=relationship,
+                ):
+                    resp = self.graph.query(cypher, params=params)
                 logger.debug(f"Graph query response: {resp}")
                 results.append(resp)
 
@@ -1115,7 +1246,14 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     params["usage_count"] = usage_count
 
                 logger.debug(f"Executing Cypher (neither exist): {cypher} with params: {params}")
-                resp = self.graph.query(cypher, params=params)
+                with self._log_span(
+                    "neo4j_upsert_relationship",
+                    user_id=user_id,
+                    source=source,
+                    destination=destination,
+                    relationship=relationship,
+                ):
+                    resp = self.graph.query(cypher, params=params)
                 logger.debug(f"Graph query response: {resp}")
                 results.append(resp)
         
@@ -1293,7 +1431,15 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             r.usage_count AS usage_count
         """
 
-        result = self.graph.query(cypher, params=params)
+        with self._log_span(
+            "neo4j_update_relationship",
+            user_id=user_id,
+            source=source,
+            destination=destination,
+            relationship=relationship,
+            log_start=False,
+        ):
+            result = self.graph.query(cypher, params=params)
 
         if result:
             result_dict = {
@@ -1324,6 +1470,74 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
 
         return {"source": source, "relationship": relationship, "target": destination}
 
+    def bulk_update_mention_metadata(self, relationship_updates, user_time, user_id, timezone_offset=None):
+        """
+        Batch relationship metadata updates to reduce per-item writes by updating usage counts and last_mentioned in a single UNWIND.
+        """
+        if not relationship_updates:
+            return
+
+        batch = [
+            {
+                "source": source,
+                "relationship": relationship,
+                "destination": destination,
+                "increment": increment,
+            }
+            for (source, relationship, destination), increment in relationship_updates.items()
+        ]
+
+        update_cypher = """
+        UNWIND $batch AS rel
+        MATCH (n {name: rel.source, user_id: $user_id})-[r]->(m {name: rel.destination, user_id: $user_id})
+        WHERE type(r) = rel.relationship
+        SET r.usage_count = COALESCE(r.usage_count, 0) + rel.increment,
+            r.last_mentioned = $last_mentioned
+        RETURN count(r) AS updated_count
+        """
+
+        params = {
+            "batch": batch,
+            "user_id": user_id,
+            "last_mentioned": user_time,
+        }
+
+        try:
+            self.graph.query(update_cypher, params=params)
+        except Exception as e:
+            logger.error(f"Error batch updating mention metadata: {e}")
+
+    def bulk_update_node_mention_metadata(self, node_updates, user_time, user_id, timezone_offset=None):
+        """
+        Batch node metadata updates to reduce per-item writes by updating usage counts and last_mentioned in a single UNWIND.
+        """
+        if not node_updates:
+            return
+
+        batch = [
+            {"name": node_name, "increment": increment}
+            for node_name, increment in node_updates.items()
+        ]
+
+        update_cypher = """
+        UNWIND $batch AS node
+        MATCH (n {name: node.name, user_id: $user_id})
+        SET n.usage_count = COALESCE(n.usage_count, 0) + node.increment,
+            n.last_mentioned = $last_mentioned
+        RETURN count(n) AS updated_count
+        """
+
+        params = {
+            "batch": batch,
+            "user_id": user_id,
+            "last_mentioned": user_time,
+        }
+
+        try:
+            self.graph.query(update_cypher, params=params)
+        except Exception as e:
+            logger.error(f"Error batch updating node mention metadata: {e}")
+
     def update_mention_metadata(self, memory_object, user_time, user_id, timezone_offset=None):
         """
         Update usage_count and last_mentioned for a memory object (node or relation) when it's selected for use.
@@ -1339,46 +1553,21 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             - If last_mentioned is not present → initialize to user_time
             - If both are present → increment usage_count and overwrite last_mentioned with user_time
         """
-        # Extract relationship components
         source = memory_object.get("source")
         relationship = memory_object.get("relationship") or memory_object.get("relatationship")
         destination = memory_object.get("destination") or memory_object.get("target")
-        
+
         if not all([source, relationship, destination]):
             logger.warning(f"Incomplete memory object for update: {memory_object}")
             return
-            
-        # Get current values or set defaults
-        current_usage_count = memory_object.get("usage_count", 0)
-        new_usage_count = current_usage_count + 1
-        
-        # Update the relationship with incremented usage_count and current timestamp
-        update_cypher = """
-        MATCH (n {name: $source_name, user_id: $user_id})
-        -[r]->(m {name: $dest_name, user_id: $user_id})
-        WHERE type(r) = $relationship_type
-        SET r.usage_count = $new_usage_count,
-            r.last_mentioned = $last_mentioned
-        RETURN r.usage_count AS updated_count
-        """
-        
-        params = {
-            "source_name": source,
-            "dest_name": destination,
-            "user_id": user_id,
-            "relationship_type": relationship,
-            "new_usage_count": new_usage_count,
-            "last_mentioned": user_time
-        }
-        
-        try:
-            result = self.graph.query(update_cypher, params=params)
-            if result:
-                logger.debug(f"Updated mention metadata: {source} -> {relationship} -> {destination} (count: {new_usage_count})")
-            else:
-                logger.warning(f"No relationship found to update: {source} -> {relationship} -> {destination}")
-        except Exception as e:
-            logger.error(f"Error updating mention metadata: {e}")
+
+        # Delegate to bulk updater to keep all metadata writes consolidated
+        self.bulk_update_mention_metadata(
+            {(source, relationship, destination): 1},
+            user_time,
+            user_id,
+            timezone_offset=timezone_offset,
+        )
 
     def update_node_mention_metadata(self, node_name, user_time, user_id, timezone_offset=None):
         """
@@ -1390,28 +1579,13 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             user_id (str): User ID for filtering
             timezone_offset (float, optional): Offset handling if needed separately
         """
-        # Update node metadata
-        update_cypher = """
-        MATCH (n {name: $node_name, user_id: $user_id})
-        SET n.usage_count = COALESCE(n.usage_count, 0) + 1,
-            n.last_mentioned = $last_mentioned
-        RETURN n.usage_count AS updated_count
-        """
-        
-        params = {
-            "node_name": node_name,
-            "user_id": user_id,
-            "last_mentioned": user_time
-        }
-        
-        try:
-            result = self.graph.query(update_cypher, params=params)
-            if result:
-                logger.debug(f"Updated node mention metadata: {node_name} (count: {result[0]['updated_count']})")
-            else:
-                logger.warning(f"No node found to update: {node_name}")
-        except Exception as e:
-            logger.error(f"Error updating node mention metadata: {e}")
+        # Delegate to bulk updater to keep all metadata writes consolidated
+        self.bulk_update_node_mention_metadata(
+            {node_name: 1},
+            user_time,
+            user_id,
+            timezone_offset=timezone_offset,
+        )
 
     def apply_weight_updates(self, user_id: str, updates: list, session_id: str = None):
         """
@@ -1531,7 +1705,13 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
                     continue
                 
                 # Execute the update query
-                query_result = self.graph.query(cypher, params=params)
+                with self._log_span(
+                    "neo4j_apply_weight_update",
+                    user_id=user_id,
+                    entity_id=entity_id,
+                    entity_type=entity_type,
+                ):
+                    query_result = self.graph.query(cypher, params=params)
                 
                 if query_result:
                     results["successful_updates"] += 1
