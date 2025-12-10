@@ -148,6 +148,7 @@ NOOP_TOOL = {
 }
 
 
+# Note: last_mentioned, usage_count, start_date, and end_date are derived server-side to reduce prompt size.
 RELATIONS_TOOL = {
     "type": "function",
     "function": {
@@ -186,25 +187,9 @@ RELATIONS_TOOL = {
                                 "type": "string",
                                 "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
                             },
-                            "start_date": {
-                                "type": "string",
-                                "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
-                            },
-                            "end_date": {
-                                "type": "string",
-                                "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
-                            },
                             "emotion": {
                                 "type": "string",
                                 "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
-                            },
-                            "last_mentioned": {
-                                "type": "string",
-                                "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
-                            },
-                            "usage_count": {
-                                "type": "integer",
-                                "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                             },
                         },
                         "required": [
@@ -409,6 +394,7 @@ NOOP_STRUCT_TOOL = {
     },
 }
 
+# Same as RELATIONS_TOOL: temporal and usage fields are filled in server-side defaults.
 RELATIONS_STRUCT_TOOL = {
     "type": "function",
     "function": {
@@ -448,25 +434,9 @@ RELATIONS_STRUCT_TOOL = {
                                 "type": "string",
                                 "description": "The current status of the relationship (e.g., 'active', 'inactive', 'pending').",
                             },
-                            "start_date": {
-                                "type": "string",
-                                "description": "The date when this relationship started, in ISO format (YYYY-MM-DD).",
-                            },
-                            "end_date": {
-                                "type": "string",
-                                "description": "The date when this relationship ended (if applicable), in ISO format (YYYY-MM-DD).",
-                            },
                             "emotion": {
                                 "type": "string",
                                 "description": "The emotional undertone or feeling the user expresses about this specific relationship. Capture the user's attitude, sentiment, or emotional quality when mentioning this relationship. Use descriptive emotion words that reflect intensity and nuance. Use 'neutral' only if no emotional context is detectable.",
-                            },
-                            "last_mentioned": {
-                                "type": "string",
-                                "description": "The timestamp when this relationship was last mentioned or referenced, in ISO format.",
-                            },
-                            "usage_count": {
-                                "type": "integer",
-                                "description": "The number of times this relationship has been referenced or mentioned (starts at 1).",
                             },
                         },
                         "required": [

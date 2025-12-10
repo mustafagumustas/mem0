@@ -1303,8 +1303,11 @@ Extract all entities from the text with their types. ***DO NOT*** answer questio
             if "usage_count" not in item or item["usage_count"] is None:
                 item["usage_count"] = 1  # Default to 1
 
-            # Optional date parameters - no defaults for these
-            # start_date and end_date can remain null
+            if "start_date" not in item or item["start_date"] is None:
+                item["start_date"] = None  # Default to None if not provided
+
+            if "end_date" not in item or item["end_date"] is None:
+                item["end_date"] = None  # Default to None if not provided
 
             # Add to filtered list if it passed all checks
             filtered_entities.append(item)
