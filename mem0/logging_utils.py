@@ -75,6 +75,7 @@ def configure_mem0_logging(level: int = logging.INFO) -> bool:
     use_color = should_use_color()
     logger = logging.getLogger("mem0")
     logger.setLevel(level)
+    logger.propagate = False  # prevent double-printing via root handlers
 
     stream_handler = None
     for handler in logger.handlers:
