@@ -37,6 +37,7 @@ from mem0.graphs.tools import (
 )
 from mem0.graphs.utils import EXTRACT_RELATIONS_PROMPT, get_delete_messages
 from mem0.utils.factory import EmbedderFactory, LlmFactory
+from mem0.logging_utils import configure_mem0_logging, format_trace_line
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class MemoryGraph:
         self.llm = LlmFactory.create(self.llm_provider, self.config.llm.config)
         self.user_id = None
         self.threshold = 0.7
+        self._color_enabled = configure_mem0_logging()
         
         # Thread pool for background weight adjustments
         self._executor = ThreadPoolExecutor(max_workers=2, thread_name_prefix="weight_adjuster")
@@ -71,8 +73,17 @@ class MemoryGraph:
         """Lightweight structured logging helper."""
         if not self.trace_enabled:
             return
+        event = fields.pop("event", "trace")
+        phase = fields.pop("phase", "info")
+        duration_ms = fields.pop("duration_ms", 0)
         try:
-            msg = " ".join(f"{k}={v}" for k, v in fields.items() if v is not None)
+            msg = format_trace_line(
+                event=event,
+                phase=phase,
+                duration_ms=duration_ms,
+                fields=fields.items(),
+                use_color=self._color_enabled,
+            )
             logger.log(level, msg)
         except Exception:
             logger.exception("Failed to emit trace log", exc_info=True)
